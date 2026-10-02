@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Webcam Autofocus
+GenericName=Webcam face autofocus
+Comment=Keeps your webcam focused on your face and provides a virtual camera for video calls
+Exec=webcam-autofocus-tray --start
+Icon=webcam-autofocus
+Terminal=false
+Categories=AudioVideo;Video;
+Keywords=webcam;autofocus;focus;camera;zoom;teams;virtual camera;v4l2loopback;
+StartupNotify=false

@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+# Load the loopback module now so the first start does not need a reboot.
+if [ "$1" = "configure" ]; then
+    modprobe v4l2loopback >/dev/null 2>&1 || true
+    if command -v update-desktop-database >/dev/null 2>&1; then
+        update-desktop-database -q /usr/share/applications || true
+    fi
+fi
+exit 0

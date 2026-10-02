@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "webcam-autofocus"
+dynamic = ["version"]
+description = "Face-tracking contrast autofocus for Linux webcams, with a virtual camera for video calls"
+readme = "README.md"
+license = { text = "MIT" }
+authors = [{ name = "Martin Kaffanke", email = "martin@kaffanke.info" }]
+requires-python = ">=3.10"
+keywords = ["webcam", "autofocus", "v4l2", "v4l2loopback", "opencv", "zoom"]
+classifiers = [
+  "Environment :: X11 Applications :: GTK",
+  "Operating System :: POSIX :: Linux",
+  "Topic :: Multimedia :: Video :: Capture",
+]
+# OpenCV, NumPy and PyGObject come from the distribution packages (see README).
+
+[project.urls]
+Homepage = "https://github.com/grauschnabel/webcam-autofocus"
+Issues = "https://github.com/grauschnabel/webcam-autofocus/issues"
+
+[project.scripts]
+webcam-autofocus = "webcam_autofocus.cli:main"
+webcam-autofocus-tray = "webcam_autofocus.tray:main"
+
+[tool.setuptools]
+packages = ["webcam_autofocus"]
+
+[tool.setuptools.dynamic]
+version = { attr = "webcam_autofocus.__version__" }

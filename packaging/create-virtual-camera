@@ -1,0 +1,28 @@
+#!/bin/sh
+# Root helper: creates one v4l2loopback device with the given name and prints its path.
+# Started through pkexec (see io.github.webcamautofocus.policy); it accepts nothing but
+# names of the form "<camera> (Autofocus)" so it cannot be abused for other purposes.
+set -eu
+export LC_ALL=C
+
+name="${1:-}"
+suffix=" (Autofocus)"
+
+case "$name" in
+    *"$suffix") ;;
+    *) echo "refusing name: $name" >&2; exit 2 ;;
+esac
+# Plain characters only. A case pattern looks at the whole string; grep would check it line
+# by line and let a name with a newline in it through.
+case "$name" in
+    *[!A-Za-z0-9' ._+()-']*) echo "refusing name: $name" >&2; exit 2 ;;
+esac
+# v4l2loopback keeps only 31 characters of a name; the program shortens its names to fit.
+if [ "${#name}" -gt 31 ]; then
+    echo "refusing name: $name" >&2
+    exit 2
+fi
+
+# Without devices=0 the module would also create an unnamed device of its own.
+modprobe v4l2loopback devices=0 exclusive_caps=1 2>/dev/null || true
+exec v4l2loopback-ctl add -n "$name" -x 1
