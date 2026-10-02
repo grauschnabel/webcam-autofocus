@@ -1,0 +1,32 @@
+name: Bug report
+description: The focus misbehaves, a camera is not found, or the app does not start
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      description: Output of `webcam-autofocus --version`, or the git commit
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Distribution and desktop
+      placeholder: Ubuntu 24.04, GNOME/Wayland
+    validations:
+      required: true
+  - type: textarea
+    id: camera
+    attributes:
+      label: Camera
+      description: Camera model and the output of `v4l2-ctl -d /dev/videoN --list-ctrls | grep focus`
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you expect, what happened instead? Include the terminal output of `webcam-autofocus` if possible.
+    validations:
+      required: true
