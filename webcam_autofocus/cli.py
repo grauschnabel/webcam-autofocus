@@ -1,4 +1,4 @@
-"""Terminal-Ansicht: Regler mit Fokuswert und Log der Fokusänderungen. Beenden mit Strg+C."""
+"""Terminal view: slider with the focus value and a log of focus changes. Quit with Ctrl+C."""
 import argparse
 import dataclasses
 import shutil
@@ -6,6 +6,7 @@ import signal
 import sys
 import time
 
+from . import __version__
 from .engine import AutoFocus, Config, EngineError
 
 UI_LINES = 11
@@ -26,20 +27,20 @@ class Renderer:
         width = max(20, min(60, cols - 14))
         lo, hi = e.a.fmin, e.a.fmax
         pos = min(max(round((e.focus - lo) / (hi - lo) * (width - 1)), 0), width - 1)
-        color = YELLOW if e.mode == "suche Fokus" else GREEN
+        color = YELLOW if e.mode == "searching focus" else GREEN
         track = f"{DIM}{'━' * pos}{RESET}{color}●{RESET}{DIM}{'━' * (width - 1 - pos)}{RESET}"
         num = str(e.focus)
         start = min(max(pos - len(num) // 2, 0), width - len(num))
         face = f"{e.box[2]} px" if e.box else "—"
         sharp = f"{e.ema:.0f}" if e.ema is not None else "—"
-        changed = f"  {YELLOW}◀ Fokus geändert{RESET}" if now - e.changed_t < 3 else ""
+        changed = f"  {YELLOW}◀ focus changed{RESET}" if now - e.changed_t < 3 else ""
         lines = [
-            f"Dell WB5023 Autofokus   {color}{e.mode}{RESET}",
+            f"{e.cam.name if e.cam else 'Webcam'} autofocus   {color}{e.mode}{RESET}",
             "",
             f"{lo:>4} {track} {hi}",
             " " * (5 + start) + f"{color}{num}{RESET}",
             "",
-            f"Schärfe {sharp}   Gesicht {face}{changed}",
+            f"Sharpness {sharp}   Face {face}{changed}",
             *[f"{DIM}{line}{RESET}" for line in list(e.log)[-(UI_LINES - 6):]],
         ]
         lines += [""] * (UI_LINES - len(lines))
@@ -50,7 +51,7 @@ class Renderer:
 
 
 def add_config_args(p):
-    """Eine Option pro Config-Feld (Name, Typ und Standard stammen aus der Dataclass)."""
+    """One option per Config field (name, type and default come from the dataclass)."""
     for f in dataclasses.fields(Config):
         flag = "--" + f.name.replace("_", "-")
         default = f.default
@@ -62,15 +63,21 @@ def add_config_args(p):
             p.add_argument(flag, type=type(default), default=default)
 
 
+def config_from_args(args):
+    """The Config for the options parsed after add_config_args()."""
+    return Config(**{f.name: getattr(args, f.name) for f in dataclasses.fields(Config)})
+
+
 def main():
-    p = argparse.ArgumentParser(description="Gesichts-Autofokus für die Dell WB5023 (Terminal-Ansicht)")
+    p = argparse.ArgumentParser(description="Face autofocus for webcams with manual focus (terminal view)")
     add_config_args(p)
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = p.parse_args()
-    cfg = Config(**{f.name: getattr(args, f.name) for f in dataclasses.fields(Config)})
-    engine = AutoFocus(cfg)
+    engine = AutoFocus(config_from_args(args))
     engine.on_frame = Renderer()
-    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
-    sys.stdout.write("\x1b[?25l")                             # Cursor aus
+    for sig in (signal.SIGTERM, signal.SIGHUP):               # kill / closed terminal: still hand the camera back
+        signal.signal(sig, lambda *_: sys.exit(0))
+    sys.stdout.write("\x1b[?25l")                             # hide cursor
     try:
         engine.run()
     except KeyboardInterrupt:
@@ -78,7 +85,7 @@ def main():
     except EngineError as err:
         sys.exit(f"\n{err}")
     finally:
-        sys.stdout.write("\x1b[?25h\nAutofokus der Kamera wieder an.\n")
+        sys.stdout.write("\x1b[?25h\nCamera autofocus back on.\n")
 
 
 if __name__ == "__main__":

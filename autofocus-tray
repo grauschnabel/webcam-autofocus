@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Startet die Tray-App (siehe webcam_autofocus/tray.py)."""
+"""Starts the tray app (see webcam_autofocus/tray.py)."""
 from webcam_autofocus.tray import main
 
 if __name__ == "__main__":

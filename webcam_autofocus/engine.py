@@ -1,6 +1,6 @@
-"""Autofokus-Engine: liest die Kamera, fokussiert auf das Gesicht, gibt das Bild an eine
-virtuelle Kamera (v4l2loopback) aus. Keine Oberfläche — die Anzeigen (Terminal, Tray)
-lesen nur den Zustand (mode, focus, ema, box, log, history, error)."""
+"""Autofocus engine: reads the camera, focuses on the face, and passes the image on to a
+virtual camera (v4l2loopback). No UI of its own — the displays (terminal, tray)
+only read the state (mode, focus, ema, box, log, history, error)."""
 import glob
 import json
 import os
@@ -14,34 +14,36 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from . import cameras
+
 AUTO = "focus_automatic_continuous"
-CALIB_FILE = Path.home() / ".cache" / "webcam-autofocus-v2.json"   # v2: Punkte mit Schärfewert (alte Datei war verrauscht)
+CALIB_DIR = Path.home() / ".cache" / "webcam-autofocus"   # one calibration file per camera (v2: points with sharpness value)
 
 
 @dataclass
 class Config:
-    device: str | None = None          # Standard: Dell WB5023 per /dev/v4l/by-id
-    out: str = "/dev/video10"          # virtuelle Kamera (v4l2loopback)
-    no_output: bool = False            # nur Fokus steuern, keine virtuelle Kamera
+    device: str | None = None          # camera (/dev/videoN); default: last chosen, otherwise first with focus control
+    out: str | None = None             # virtual camera; default: "<camera name> (Autofocus)", created if needed
+    no_output: bool = False            # only control focus, no virtual camera
     width: int = 1280
     height: int = 720
     fmin: int = 1
     fmax: int = 300
-    coarse: int = 30                   # Schrittweite der Grobsuche
-    climb: int = 40                    # Start-Schrittweite beim Nachfokussieren
-    settle: float = 0.2                # Sekunden Wartezeit nach Fokusänderung
-    size_tol: float = 0.15             # Gesichtsbreite ±, ab der neu fokussiert wird
-    size_tol_pred: float = 0.08        # dasselbe, sobald eine Vorhersage möglich ist
-    dynamic: bool = False              # eval_every automatisch an die CPU-Last anpassen
-    cpu_target: float = 25.0           # Ziel: Prozent eines CPU-Kerns für dieses Programm (dynamisch)
-    recheck: float = 60.0              # Sekunden: bei ruhigem Sitzen den Fokus regelmäßig kontrollieren/verbessern (0 = aus)
-    verify_delay: float = 1.5          # Sekunden bis zur Kontrolle nach einer Vorhersage
-    sharp_drop: float = 0.6            # Schärfe-Anteil, unter dem neu fokussiert wird
-    hold: float = 1.5                  # Sekunden, die das anhalten muss
-    cooldown: float = 5.0              # Sperrzeit nach dem Fokussieren
-    eval_every: int = 10               # nur jedes x-te Kamerabild auswerten (Schärfe/Gesicht)
-    freeze: bool = False               # während der Suche Standbild ausgeben
-    reset: bool = False                # gelernte Kalibrierung ignorieren
+    coarse: int = 30                   # step size of the coarse search
+    climb: int = 40                    # initial step size when refocusing
+    settle: float = 0.2                # seconds to wait after a focus change
+    size_tol: float = 0.15             # face width ± beyond which to refocus
+    size_tol_pred: float = 0.08        # same, once a prediction is available
+    dynamic: bool = False              # adapt eval_every to the CPU load automatically
+    cpu_target: float = 25.0           # target: percent of one CPU core for this program (dynamic)
+    recheck: float = 60.0              # seconds: when sitting still, check/improve the focus regularly (0 = off)
+    verify_delay: float = 1.5          # seconds until the check after a prediction
+    sharp_drop: float = 0.6            # sharpness fraction below which to refocus
+    hold: float = 1.5                  # seconds this has to persist
+    cooldown: float = 5.0              # lockout time after focusing
+    eval_every: int = 10               # evaluate only every n-th camera frame (sharpness/face)
+    freeze: bool = False               # output a still image during the search
+    reset: bool = False                # ignore the learned calibration
 
 
 class EngineError(Exception):
@@ -52,16 +54,18 @@ class Stopped(Exception):
     pass
 
 
-def find_device():
-    hits = sorted(glob.glob("/dev/v4l/by-id/*Dell_Webcam_WB5023*-video-index0"))
-    return os.path.realpath(hits[0]) if hits else "/dev/video2"
-
-
 def v4l2(dev, **ctrls):
+    """Set V4L2 controls through v4l2-ctl; a failure becomes an EngineError that says why."""
     args = ["v4l2-ctl", "-d", dev]
     for name, value in ctrls.items():
         args += ["-c", f"{name}={value}"]
-    subprocess.run(args, check=True, capture_output=True)
+    try:
+        subprocess.run(args, check=True, capture_output=True, text=True, errors="replace", timeout=5)
+    except subprocess.CalledProcessError as err:
+        why = (err.stderr or "").strip().splitlines()
+        raise EngineError("v4l2-ctl failed: " + (why[-1] if why else f"exit status {err.returncode}"))
+    except (OSError, subprocess.SubprocessError) as err:         # not installed, did not answer in time
+        raise EngineError(f"v4l2-ctl failed: {err}")
 
 
 def load_cascade():
@@ -71,11 +75,11 @@ def load_cascade():
         path = os.path.join(d, "haarcascade_frontalface_default.xml")
         if d and os.path.exists(path):
             return cv2.CascadeClassifier(path)
-    raise EngineError("Haar-Cascade nicht gefunden (Paket opencv-data installieren)")
+    raise EngineError("Haar cascade not found (install the opencv-data package)")
 
 
 def sharpness(frame, box):
-    """Varianz des Laplace-Operators im Kern der Gesichtsbox (Augen/Nase/Mund)."""
+    """Variance of the Laplacian in the core of the face box (eyes/nose/mouth)."""
     x, y, w, h = box
     x, y, w, h = x + int(w * .2), y + int(h * .2), int(w * .6), int(h * .6)
     roi = frame[max(y, 0):y + h, max(x, 0):x + w]
@@ -88,74 +92,116 @@ def sharpness(frame, box):
 class AutoFocus:
     def __init__(self, cfg=None):
         self.a = cfg or Config()
-        self.on_frame = None               # Hook, pro Kamerabild aufgerufen (Anzeige drosselt selbst)
-        self.running = False
+        self.on_frame = None               # hook, called per camera frame (the display throttles itself)
         self.error = None
         self._thread = None
         self._stop = threading.Event()
+        self._base = (self.a.fmin, self.a.fmax, self.a.coarse, self.a.climb)   # defaults that each camera is fitted to
+        self.preview_on = False            # the UI sets this while a preview is visible
+        self.preview_width = 640           # desired width of the preview image in pixels
+        self.preview_overlay = False       # draw the detected face frame into the preview image
         self._reset_state()
 
-    def _reset_state(self):
+    def _pick_camera(self):
+        """Pick a camera and fit the focus range/search steps to it."""
         a = self.a
-        self.focus = a.fmin
-        self.box = None            # geglättete Gesichtsbox
-        self.ref = None            # Schärfe direkt nach dem letzten Fokussieren
-        self.ref_w = None          # Gesichtsbreite dabei
+        self.cam = cameras.find_camera(dev=a.device)
+        fmin, fmax, coarse, climb = self._base
+        if self.cam:
+            a.fmin, a.fmax = max(fmin, self.cam.fmin), min(fmax, self.cam.fmax)
+            scale = min(1.0, (a.fmax - a.fmin) / max(1, fmax - fmin))   # smaller range -> smaller steps
+            a.coarse, a.climb = max(1, round(coarse * scale)), max(2, round(climb * scale))
+        else:
+            a.fmin, a.fmax, a.coarse, a.climb = fmin, fmax, coarse, climb
+
+    def set_camera(self, cam):
+        """Choose another camera (engine must be stopped); loads its calibration. The choice is
+        remembered by name so the camera is found again under a new number after a USB dropout."""
+        cameras.save_choice(cam.name)
+        self.a.device = None
+        self.a.out = None
+        self._reset_state()
+
+    @property
+    def virtual_name(self):
+        return self.cam.virtual_name if self.cam else None
+
+    def _calib_file(self):
+        slug = "".join(c if c.isalnum() else "-" for c in (self.cam.name if self.cam else "unknown")).lower()
+        return CALIB_DIR / f"{slug}-v2.json"
+
+    def _reset_state(self):
+        self._pick_camera()
+        self.focus = self.a.fmin
+        self.mode = "off"
+        self.log = deque(maxlen=8)
+        self.history = deque(maxlen=300)   # (time, focus, sharpness), every 0.1 s
+        self.changed_t = 0.0
+        self.last_hist = 0.0
+        self.preview = None        # (width, height, BGR bytes) of the output image, scaled down
+        self.preview_t = 0.0
+        self._reset_run()
+        self._load_calibration()
+
+    def _reset_run(self):
+        """Forget everything about the previous run. In between, the camera's own autofocus moved
+        the lens, so the old sharpness reference, face width and timers no longer fit."""
+        self.box = None            # smoothed face box
+        self.ref = None            # sharpness right after the last focusing
+        self.ref_w = None          # face width at that time
         self.ema = None
         self.bad_since = None
         self.cooldown = 0.0
-        self.freeze = None         # Standbild während der Suche
-        self.mode = "aus"
-        self.log = deque(maxlen=8)
-        self.history = deque(maxlen=300)   # (Zeit, Fokus, Schärfe), alle 0,1 s
-        self.changed_t = 0.0
-        self.t0 = time.time()
-        self.verify_at = None      # Zeitpunkt der Kontrolle nach einer Vorhersage
-        self.last_hist = 0.0
-        self.preview_on = False    # Oberfläche setzt das, solange eine Vorschau sichtbar ist
-        self.preview_overlay = False   # gefundenen Gesichtsrahmen ins Vorschaubild zeichnen
-        self.preview = None        # (Breite, Höhe, BGR-Bytes) des Ausgabebilds, verkleinert
-        self.preview_t = 0.0
-        self.calib = {}            # Gesichtsbreite (Bucket) -> [Breite, Fokus, Schärfe], gelernt aus jeder Suche
-        self.recheck_at = None     # nächste regelmäßige Kontrolle
-        self.model = None          # (a, b, wmin, wmax): Fokus = a + b * Gesichtsbreite
-        if not a.reset:
+        self.freeze = None         # still image during the search
+        self.verify_at = None      # time of the check after a prediction
+        self.recheck_at = None     # next regular check
+        self.face_t = time.time()  # last time a face was seen (at the start: since when we wait for one)
+
+    def _load_calibration(self):
+        """Load the stored calibration of the current camera."""
+        self.calib = {}            # face width (bucket) -> [width, focus, sharpness], learned from every search
+        self.model = None          # (a, b, wmin, wmax): focus = a + b * face width
+        if not self.a.reset:
             try:
-                for w, f, sc in json.loads(CALIB_FILE.read_text())["points"]:
+                for w, f, sc in json.loads(self._calib_file().read_text())["points"]:
                     self.calib[round(w / 15)] = [w, f, sc]
                 self.fit()
             except (OSError, ValueError, KeyError):
                 pass
 
-    # ---------- Kalibrierung: Gesichtsbreite -> Fokus ----------
+    # ---------- Calibration: face width -> focus ----------
     def fit(self):
         pts = list(self.calib.values())
         self.model = None
         if len(pts) < 2:
             return
         ws, fs = np.array([p[0] for p in pts], float), np.array([p[1] for p in pts], float)
-        wt = np.array([p[2] for p in pts], float)             # schärfere Messungen zählen mehr
-        if ws.max() < ws.min() * 1.15:                       # zu wenig Spreizung für eine Gerade
+        # sharper measurements count more; never 0: polyfit with all-zero weights aborts the whole process in LAPACK
+        wt = np.maximum(np.array([p[2] for p in pts], float), 1e-6)
+        if ws.max() < ws.min() * 1.15:                       # too little spread for a line
             return
         b, a = np.polyfit(ws, fs, 1, w=np.sqrt(wt))
-        keep = np.abs(fs - (a + b * ws)) < 40                 # Ausreißer raus, dann neu anpassen
+        keep = np.abs(fs - (a + b * ws)) < 40                 # drop outliers, then fit again
         if 2 <= keep.sum() < len(ws) and ws[keep].max() >= ws[keep].min() * 1.15:
             ws, fs, wt = ws[keep], fs[keep], wt[keep]
             b, a = np.polyfit(ws, fs, 1, w=np.sqrt(wt))
-        if b > 0:                                            # näher (breiteres Gesicht) = höherer Wert
+        if b > 0:                                            # closer (wider face) = higher value
             self.model = (a, b, ws.min(), ws.max())
+
+    def _clamp(self, focus):
+        return int(min(max(focus, self.a.fmin), self.a.fmax))
 
     def predict(self, w):
         if self.model is None:
             return None
         a, b, wmin, wmax = self.model
-        if not wmin * .75 <= w <= wmax * 1.3:                # nicht weit außerhalb extrapolieren
+        if not wmin * .75 <= w <= wmax * 1.3:                # do not extrapolate far outside
             return None
-        return int(min(max(a + b * w, self.a.fmin), self.a.fmax))
+        return self._clamp(a + b * w)
 
     def record(self, w, focus, score):
-        """Messpunkt merken. Pro Breite gewinnt die schärfere Messung; schwächere nagen den alten
-        Wert nur an (Licht kann sich ändern), bis eine neue Messung ihn ablöst."""
+        """Remember a measurement point. Per width the sharper measurement wins; weaker ones only
+        chip away at the old value (light can change) until a new measurement replaces it."""
         key = round(w / 15)
         old = self.calib.get(key)
         if old and score < .7 * old[2] and abs(old[1] - focus) > 5:
@@ -167,36 +213,51 @@ class AutoFocus:
             self.calib.pop(next(iter(self.calib)))
         self.fit()
         try:
-            CALIB_FILE.parent.mkdir(parents=True, exist_ok=True)
-            CALIB_FILE.write_text(json.dumps({"points": list(self.calib.values())}))
+            CALIB_DIR.mkdir(parents=True, exist_ok=True)
+            self._calib_file().write_text(json.dumps({"points": list(self.calib.values())}))
         except OSError:
             pass
 
-    # ---------- Kamera / Ausgabe ----------
+    # ---------- Camera / output ----------
     def _open(self):
         a = self.a
-        self.dev = a.device or find_device()
+        before = self.cam
+        self._pick_camera()
+        if not self.cam:
+            raise EngineError("No camera with focus control found (v4l2-ctl --list-devices)")
+        if self.cam.name != (before.name if before else None):   # plugged in after the start, or another one than loaded
+            self._load_calibration()
+        self.dev = self.cam.dev
         self.cascade = load_cascade()
         self.cap = cv2.VideoCapture(self.dev, cv2.CAP_V4L2)
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, a.width)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, a.height)
-        ok, frame = self.cap.read()
-        if not ok:
-            self.cap.release()
-            raise EngineError("Kein Bild von der Kamera — nutzt ein anderes Programm sie gerade (z. B. Zoom)?")
-        self.h, self.w = frame.shape[:2]
-        self.last = frame
-        self.out = None
-        if not a.no_output:
-            if not os.path.exists(a.out):
-                self.cap.release()
-                raise EngineError(f"Virtuelle Kamera {a.out} fehlt — setup.sh ausgeführt?")
-            self.out = subprocess.Popen(
-                ["ffmpeg", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "bgr24",
-                 "-s", f"{self.w}x{self.h}", "-r", "30", "-i", "-",
-                 "-pix_fmt", "yuv420p", "-f", "v4l2", a.out],
-                stdin=subprocess.PIPE)
+        try:
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, a.width)
+            self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, a.height)
+            ok, frame = self.cap.read()
+            if not ok:
+                raise EngineError("No image from the camera — is another program using it (e.g. Zoom)?")
+            self.h, self.w = frame.shape[:2]
+            self.last = frame
+            self.out = None
+            if not a.no_output:
+                try:
+                    out = a.out or cameras.ensure_virtual(self.cam)
+                except RuntimeError as err:
+                    raise EngineError(str(err))
+                if not os.path.exists(out):
+                    raise EngineError(f"Virtual camera {out} is missing — did you run setup.sh?")
+                try:
+                    self.out = subprocess.Popen(
+                        ["ffmpeg", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "bgr24",
+                         "-s", f"{self.w}x{self.h}", "-r", "30", "-i", "-",
+                         "-pix_fmt", "yuv420p", "-f", "v4l2", out],
+                        stdin=subprocess.PIPE)
+                except OSError as err:
+                    raise EngineError(f"ffmpeg could not be started ({err}) — is it installed?")
+        except BaseException:
+            self.cap.release()                               # a failed start must not keep the camera busy
+            raise
 
     def _close(self):
         try:
@@ -216,13 +277,13 @@ class AutoFocus:
             raise Stopped
         ok, frame = self.cap.read()
         if not ok:
-            raise EngineError("Kamera liefert kein Bild mehr")
+            raise EngineError("The camera no longer delivers an image")
         self.last = frame
         if self.out:
             try:
                 self.out.stdin.write((self.freeze if self.freeze is not None else frame).tobytes())
             except BrokenPipeError:
-                raise EngineError("ffmpeg/virtuelle Kamera beendet — läuft v4l2loopback?")
+                raise EngineError("ffmpeg/virtual camera terminated — is v4l2loopback running?")
         now = time.time()
         if self.preview_on and now - self.preview_t >= 0.1:
             self._make_preview(frame, now)
@@ -234,24 +295,24 @@ class AutoFocus:
         return frame
 
     def _make_preview(self, frame, now):
-        """Ausgabebild (wie es in Zoom ankäme) verkleinern; nur auf Anfrage, kostet sonst nichts."""
+        """Scale down the output image (as it would arrive in Zoom); only on request, costs nothing otherwise."""
         img = self.freeze if self.freeze is not None else frame
-        s = min(1.0, 1280 / self.w)                          # volle Auflösung (max. 1280 px), damit ein großes Fenster scharf bleibt
+        s = min(1.0, self.preview_width / self.w)            # as big as the preview in the window (the UI sets preview_width)
         small = img if s == 1 else cv2.resize(img, (int(self.w * s), int(self.h * s)), interpolation=cv2.INTER_AREA)
         if self.preview_overlay and self.box:
-            small = small.copy()
-        if self.preview_overlay and self.box:
+            if s == 1:
+                small = small.copy()                         # do not draw into the image that goes to the virtual camera
             x, y, w, h = (int(v * s) for v in self.box)
-            color = (26, 153, 242) if self.mode == "suche Fokus" else (90, 179, 51)   # BGR: orange / grün
+            color = (26, 153, 242) if self.mode == "searching focus" else (90, 179, 51)   # BGR: orange / green
             cv2.rectangle(small, (x, y), (x + w, y + h), color, max(2, int(3 * s)))
         self.preview = (small.shape[1], small.shape[0], small.tobytes())
         self.preview_t = now
 
     def set_focus(self, value):
-        value = int(min(max(value, self.a.fmin), self.a.fmax))
+        value = self._clamp(value)
         v4l2(self.dev, focus_absolute=value)
         self.focus = value
-        end = time.time() + self.a.settle      # Fokusmotor laufen lassen, Puffer leeren
+        end = time.time() + self.a.settle      # let the focus motor run, drain the buffer
         while time.time() < end:
             self.grab()
 
@@ -268,8 +329,8 @@ class AutoFocus:
         return tuple(int(v / s) for v in (x, y, w, h))
 
     def _adapt(self, now):
-        """Alle 3 s die eigene CPU-Last messen und eval_every nachführen (zu hoch -> seltener auswerten)."""
-        if self.ref is None:                                 # noch kein Fokuswert: zügig auswerten
+        """Measure own CPU load every 3 s and adjust eval_every (too high -> evaluate less often)."""
+        if self.ref is None:                                 # no focus value yet: evaluate quickly
             self.a.eval_every = min(self.a.eval_every, 5)
             return
         cpu = time.process_time()
@@ -284,26 +345,26 @@ class AutoFocus:
                 elif load < self.a.cpu_target * .85 and k > 1:
                     self.a.eval_every = max(1, k - max(1, k // 5))
 
-    # ---------- Fokussuche ----------
+    # ---------- Focus search ----------
     def search(self, box, reason):
         old = self.focus
-        verify = reason == "Kontrolle"
+        verify = reason == "check"
         self.verify_at = None
-        self.mode = "suche Fokus"
-        if self.a.dynamic:                                   # orange = ohne Wert: schnell auswerten, danach wieder nach Last
+        self.mode = "searching focus"
+        if self.a.dynamic:                                   # orange = no value: evaluate quickly, afterwards by load again
             self.a.eval_every = min(self.a.eval_every, 5)
         self.freeze = self.last.copy() if self.a.freeze else None
         scores = {}
 
         def score(v):
-            v = int(min(max(v, self.a.fmin), self.a.fmax))
+            v = self._clamp(v)
             if v not in scores:
                 self.set_focus(v)
                 scores[v] = self.measure(box)
             return scores[v]
 
         def refine(center, step):
-            while step >= 4:                                 # Schritte halbieren
+            while step >= 4:                                 # halve the steps
                 score(center - step)
                 score(center + step)
                 center = max(scores, key=scores.get)
@@ -311,7 +372,7 @@ class AutoFocus:
             return center
 
         def climb(start, step, first_dir=1):
-            """Bergsteigen: vom Startwert in die bessere Richtung, solange es besser wird."""
+            """Hill climbing: from the start value in the better direction, as long as it improves."""
             best = start
             score(best)
             while step >= 5:
@@ -327,28 +388,27 @@ class AutoFocus:
             return best
 
         def peak(v):
-            """Echter Gipfel? Der Wert muss deutlich schärfer sein als das Schlechteste, das wir probiert haben."""
+            """Real peak? The value must be clearly sharper than the worst one we tried."""
             return len(scores) < 3 or scores[v] >= 1.3 * min(scores.values())
 
+        known = float(np.median([p[2] for p in self.calib.values()])) if self.calib else 0   # typical earlier sharpness
         center, predicted = None, False
-        if verify:                                           # Kontrolle: nur Feintuning um den aktuellen Wert
+        if verify:                                           # check: only fine-tuning around the current value
             center = climb(old, 10)
             guess = self.predict(box[2])
-            known = float(np.median([p[2] for p in self.calib.values()])) if self.calib else 0
             if not peak(center) or scores[center] < .3 * known or \
                     (guess is not None and abs(center - guess) > 50 and scores[center] < .6 * known):
-                center = None                                # Kontrolle findet keinen Gipfel -> Gesamtsuche
-        elif self.ref is not None or self.model is not None:   # lokal suchen (nach dem Start oder mit gespeichertem Modell)
+                center = None                                # check finds no peak -> full search
+        elif self.ref is not None or self.model is not None:   # search locally (after start or with a saved model)
             guess = self.predict(box[2])
-            if guess is not None:                            # Vorhersage aus Gesichtsbreite, nur Feintuning
+            if guess is not None:                            # prediction from face width, fine-tuning only
                 center, predicted = climb(guess, 10), True
-            elif self.ref is not None:                       # Richtung aus Größenänderung: näher = höherer Wert
+            elif self.ref is not None:                       # direction from size change: closer = higher value
                 center = climb(old, self.a.climb, 1 if box[2] >= self.ref_w else -1)
-            known = float(np.median([p[2] for p in self.calib.values()])) if self.calib else 0
             if center is not None and (not peak(center) or scores[center] < .3 * known or
                                        (self.ref is not None and scores[center] < .5 * self.ref)):
-                center, predicted = None, False              # kein klarer Gipfel -> lokal reicht nicht
-        if center is None:                                   # Erstfokus/Notfall: Gesamtbereich grob abfahren
+                center, predicted = None, False              # no clear peak -> local is not enough
+        if center is None:                                   # initial focus/fallback: sweep the whole range coarsely
             for v in range(self.a.fmin, self.a.fmax + 1, self.a.coarse):
                 score(v)
             center = refine(max(scores, key=scores.get), self.a.coarse // 2)
@@ -356,7 +416,7 @@ class AutoFocus:
         self.set_focus(center)
         self.freeze = None
         self.ref = self.measure(box, 8)
-        if trusted:                                          # nur klare Gipfel ins Gedächtnis
+        if trusted and self.box is not None:                 # only clear peaks of a really detected face into memory
             self.record(box[2], center, self.ref)
         self.recheck_at = time.time() + self.a.recheck if self.a.recheck else None
         self.ref_w = box[2]
@@ -365,43 +425,45 @@ class AutoFocus:
         self.cooldown = time.time() + self.a.cooldown
         stamp = time.strftime('%H:%M:%S')
         if verify and center == old:
-            self.log.append(f"{stamp}  Kontrolle: Fokus {center} stimmt")
+            self.log.append(f"{stamp}  Check: focus {center} is right")
         else:
             self.changed_t = time.time()
-            self.log.append(f"{stamp}  Fokus {old} → {center}  ({reason}{' · Vorhersage' if predicted else ''})")
-        if predicted:                                        # Vorhersage später noch einmal gegenprüfen
+            self.log.append(f"{stamp}  Focus {old} → {center}  ({reason}{' · prediction' if predicted else ''})")
+        if predicted:                                        # double-check the prediction again later
             self.verify_at = time.time() + self.a.verify_delay
-        self.mode = "Gesicht verfolgt"
+        self.mode = "tracking face"
 
     def needs_refocus(self, box, now):
-        """Wann neu fokussieren? Erste Messung, Gesicht deutlich näher/weiter, oder Schärfe eingebrochen."""
+        """When to refocus? First measurement, face clearly closer/farther, or sharpness dropped."""
         if self.ref is None:
-            return "Start" if self.box is not None or now - self.t0 > 3 else None
+            return "Start" if self.box is not None or now - self.face_t > 3 else None   # no face yet: wait 3 s, then try anyway
         if now < self.cooldown:
             return None
         reason = None
         tol = self.a.size_tol_pred if self.model else self.a.size_tol
         if abs(box[2] / self.ref_w - 1) > tol:
-            reason = "Gesicht näher/weiter"
+            reason = "face closer/farther"
         elif self.ema < self.a.sharp_drop * self.ref:
-            reason = "Bild unscharf"
+            reason = "image blurry"
         if reason is None:
             self.bad_since = None
             return None
         self.bad_since = self.bad_since or now
         return reason if now - self.bad_since > self.a.hold else None
 
-    # ---------- Hauptschleife ----------
+    # ---------- Main loop ----------
     def run(self):
-        """Blockiert, bis stop() aufgerufen wird oder ein Fehler auftritt (EngineError)."""
+        """Blocks until stop() is called or an error occurs (EngineError)."""
         self._stop.clear()
         self.error = None
-        self.mode = "warte auf Gesicht"
-        self.face_t = time.time()
+        self.mode = "waiting for face"
+        self._reset_run()
         self._open()
-        self.running = True
         try:
-            v4l2(self.dev, **{AUTO: 0})
+            try:
+                v4l2(self.dev, **{AUTO: 0})
+            except EngineError:
+                pass                                         # no autofocus control (only focus_absolute): nothing to switch off
             n = 0
             while True:
                 frame = self.grab()
@@ -410,23 +472,23 @@ class AutoFocus:
                 if self.a.dynamic:
                     self._adapt(now)
                 k = max(1, int(self.a.eval_every))
-                if n % k:                                        # Bild nur durchreichen, nicht auswerten
+                if n % k:                                        # just pass the frame through, do not evaluate
                     continue
-                if (n // k) % max(1, round(6 / k)) == 0:     # Gesicht ca. alle 6 Kamerabilder
+                if (n // k) % max(1, round(6 / k)) == 0:     # face roughly every 6 camera frames
                     found = self.find_face(frame)
                     if found:
                         self.face_t = now
                         self.box = found if self.box is None else tuple(
                             int(.7 * o + .3 * f) for o, f in zip(self.box, found))
-                if self.ref is not None and now - self.face_t > 2.5:   # Gesicht weg (Kopf gedreht): Fokus halten, nichts neu suchen
+                if self.ref is not None and now - self.face_t > 2.5:   # face gone (head turned): hold focus, do not search again
                     self.box = None
                     self.bad_since = None
                     self.verify_at = None
-                    if self.mode == "Gesicht verfolgt":
-                        self.mode = "Gesicht verloren (Fokus bleibt)"
+                    if self.mode == "tracking face":
+                        self.mode = "face lost (focus held)"
                     continue
-                if self.mode.startswith("Gesicht verloren"):
-                    self.mode = "Gesicht verfolgt"
+                if self.mode.startswith("face lost"):
+                    self.mode = "tracking face"
                 box = self.box or (int(self.w * .35), int(self.h * .2),
                                    int(self.w * .3), int(self.h * .45))
                 s = sharpness(frame, box)
@@ -434,23 +496,22 @@ class AutoFocus:
                 reason = self.needs_refocus(box, now)
                 if reason is None and self.verify_at and now >= self.verify_at:
                     self.verify_at = None
-                    if abs(box[2] / self.ref_w - 1) <= self.a.size_tol_pred:   # nur wenn du ruhig sitzt
-                        reason = "Kontrolle"
+                    if abs(box[2] / self.ref_w - 1) <= self.a.size_tol_pred:   # only when you sit still
+                        reason = "check"
                 if (reason is None and self.recheck_at and now >= self.recheck_at and now >= self.cooldown
                         and self.ref_w and abs(box[2] / self.ref_w - 1) <= self.a.size_tol_pred):
-                    reason = "Kontrolle"                      # regelmäßig prüfen und verbessern
+                    reason = "check"                          # check and improve regularly
                 if reason:
                     self.search(box, reason)
         except Stopped:
             pass
         finally:
-            self.running = False
-            self.mode = "aus"
+            self.mode = "off"
             self._close()
 
-    # ---------- Steuerung aus einer Oberfläche (eigener Thread) ----------
+    # ---------- Control from a UI (own thread) ----------
     def start(self):
-        if self._thread and self._thread.is_alive():
+        if self.active:
             return
         self.error = None
         self._thread = threading.Thread(target=self._thread_main, daemon=True)
@@ -461,10 +522,9 @@ class AutoFocus:
             self.run()
         except EngineError as e:
             self.error = str(e)
-        except Exception as e:                                # Unerwartetes sichtbar machen statt still sterben
+        except Exception as e:                                # make the unexpected visible instead of dying silently
             self.error = f"{type(e).__name__}: {e}"
-        self.running = False
-        self.mode = "aus"
+        self.mode = "off"
 
     def stop(self):
         self._stop.set()
@@ -473,5 +533,5 @@ class AutoFocus:
 
     @property
     def active(self):
-        """True, solange der Thread läuft (auch während des Kamera-Öffnens)."""
+        """True as long as the thread runs (also while the camera is being opened)."""
         return bool(self._thread and self._thread.is_alive())

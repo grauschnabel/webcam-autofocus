@@ -1,18 +1,19 @@
-"""Tray-App (GTK 4 / libadwaita): Icon in der Panel-Leiste zum Ein-/Ausschalten, dazu ein Fenster
-mit Regler, Schärfe-Verlauf und Log.
+"""Tray app (GTK 4 / libadwaita): panel icon to switch on/off, plus a window
+with slider, sharpness history and log.
 
-Das Icon meldet sich direkt per D-Bus als StatusNotifierItem an (kein GTK-3-AppIndicator nötig):
-  Linksklick               Autofokus ein/aus
-  Mittelklick              Fenster zeigen
-  Rechtsklick              Menü (Ein/Aus · Fenster öffnen · Beenden), per dbusmenu
+The icon registers directly over D-Bus as a StatusNotifierItem (no GTK 3 AppIndicator needed):
+  Left click               Autofocus on/off
+  Middle click             Show window
+  Right click              Menu (On/Off · Open window · Quit), via dbusmenu
 """
 import argparse
-import dataclasses
 import math
 import os
+import signal
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 
 import gi
@@ -21,11 +22,12 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
-from .cli import add_config_args  # noqa: E402
-from .engine import AutoFocus, Config  # noqa: E402
+from .cli import add_config_args, config_from_args  # noqa: E402
+from . import __version__, cameras  # noqa: E402
+from .engine import AutoFocus  # noqa: E402
 
 APP_ID = "io.github.WebcamAutofocus"
-ICON_ON, ICON_OFF, ICON_ERR = "on", "off", "error"       # Zustand des Panel-Icons (Linse grün / rot / orange)
+ICON_ON, ICON_OFF, ICON_ERR = "on", "off", "error"       # state of the panel icon (lens green / red / orange)
 LENS = {ICON_ON: (0.20, 0.78, 0.35), ICON_OFF: (0.90, 0.22, 0.22), ICON_ERR: (0.95, 0.60, 0.10)}
 GRAPH_SECONDS = 30
 GREEN, ORANGE, RED = (0.20, 0.70, 0.35), (0.95, 0.60, 0.10), (0.85, 0.25, 0.25)
@@ -59,7 +61,7 @@ WATCHER = "org.kde.StatusNotifierWatcher"
 
 
 def panel_dark():
-    """COSMIC-Theme dunkel? (Pixmaps kann das Panel nicht umfärben, deshalb passen wir das Gehäuse selbst an.)"""
+    """COSMIC theme dark? (The panel cannot recolor pixmaps, so we adapt the body ourselves.)"""
     try:
         return (Path.home() / ".config/cosmic/com.system76.CosmicTheme.Mode/v1/is_dark").read_text().strip() == "true"
     except OSError:
@@ -67,8 +69,8 @@ def panel_dark():
 
 
 def render_icon(state, size, dark=False):
-    """camera-web-symbolic (Form aus dem Cosmic-Icon-Theme) mit farbiger Linse als SNI-Pixmap
-    (ARGB32, Big-Endian, nicht vormultipliziert)."""
+    """camera-web-symbolic (shape from the Cosmic icon theme) with a colored lens as SNI pixmap
+    (ARGB32, big-endian, not premultiplied)."""
     import cairo
     import numpy as np
     surf = cairo.ImageSurface(cairo.FORMAT_ARGB32, size, size)
@@ -76,13 +78,13 @@ def render_icon(state, size, dark=False):
     cr.scale(size / 16, size / 16)
     body = (0.93, 0.93, 0.93) if dark else (0.137, 0.137, 0.137)
     cr.set_source_rgb(*body)
-    cr.arc(8, 7, 6, 0, 2 * math.pi), cr.fill()                 # Kopf
-    cr.move_to(4, 12), cr.curve_to(2, 12, 2, 14, 2, 14)        # Fuß
+    cr.arc(8, 7, 6, 0, 2 * math.pi), cr.fill()                 # head
+    cr.move_to(4, 12), cr.curve_to(2, 12, 2, 14, 2, 14)        # foot
     cr.line_to(2, 15), cr.line_to(14, 15), cr.line_to(14, 14)
     cr.curve_to(14, 14, 14, 12, 12, 12), cr.close_path(), cr.fill()
-    cr.set_source_rgb(*LENS[state])                            # Linse (im Original ein Loch)
+    cr.set_source_rgb(*LENS[state])                            # lens (a hole in the original)
     cr.arc(8, 7, 2.9, 0, 2 * math.pi), cr.fill()
-    cr.set_source_rgba(1, 1, 1, .6)                            # Glanzpunkt
+    cr.set_source_rgba(1, 1, 1, .6)                            # highlight
     cr.arc(7.1, 6.1, 0.8, 0, 2 * math.pi), cr.fill()
     surf.flush()
     a = np.frombuffer(surf.get_data(), np.uint8).reshape(size, size, 4).astype(np.float32)   # B G R A
@@ -130,13 +132,13 @@ MENU_PATH = "/MenuBar"
 
 
 class TrayIcon:
-    """Minimaler StatusNotifierItem mit dbusmenu (Rechtsklick-Menü)."""
+    """Minimal StatusNotifierItem with dbusmenu (right-click menu)."""
     PATH, IFACE = "/StatusNotifierItem", "org.kde.StatusNotifierItem"
 
     def __init__(self, on_activate, on_secondary, on_quit):
         self.on_activate, self.on_secondary, self.on_quit = on_activate, on_secondary, on_quit
         self.icon, self.tip = ICON_OFF, ""
-        self.toggle_label, self.revision = "Autofokus einschalten", 1
+        self.toggle_label, self.revision = "Turn autofocus on", 1
         self._icons, self.dark = {}, panel_dark()
         self.conn = Gio.bus_get_sync(Gio.BusType.SESSION, None)
         node = Gio.DBusNodeInfo.new_for_xml(SNI_XML)
@@ -145,7 +147,7 @@ class TrayIcon:
         self.conn.register_object(MENU_PATH, menu.interfaces[0], self._menu_call, self._menu_get, lambda *a: False)
         self.name = f"org.kde.StatusNotifierItem-{os.getpid()}-1"
         Gio.bus_own_name_on_connection(self.conn, self.name, Gio.BusNameOwnerFlags.NONE, None, None)
-        # Meldet sich (neu) an, sobald der Watcher des Panels da ist — auch nach einem Panel-Neustart.
+        # Registers (again) as soon as the panel's watcher is there — also after a panel restart.
         Gio.bus_watch_name_on_connection(self.conn, WATCHER, Gio.BusNameWatcherFlags.NONE,
                                          lambda *a: self._register(), None)
 
@@ -154,19 +156,23 @@ class TrayIcon:
                        GLib.Variant("(s)", (self.name,)), None, Gio.DBusCallFlags.NONE, -1, None, None)
 
     def _pixmaps(self):
+        """IconPixmap of the current icon as a ready Variant: rendering it takes ~0.1 s on the GTK thread, so
+        it is done once per look (every property read of the panel asks for it)."""
         key = (self.icon, self.dark)
         if key not in self._icons:
-            self._icons[key] = [render_icon(self.icon, n, self.dark) for n in (22, 32, 48, 64)]
+            self._icons[key] = GLib.Variant("a(iiay)", [render_icon(self.icon, n, self.dark) for n in (22, 32, 48, 64)])
         return self._icons[key]
 
     def _get(self, conn, sender, path, iface, prop):
+        if prop == "IconPixmap":
+            return self._pixmaps()
         v = GLib.Variant
         return {
             "Category": v("s", "ApplicationStatus"), "Id": v("s", "webcam-autofocus"),
-            "Title": v("s", "Webcam Autofokus"), "Status": v("s", "Active"), "WindowId": v("u", 0),
-            "IconName": v("s", ""), "IconPixmap": v("a(iiay)", self._pixmaps()),
+            "Title": v("s", "Webcam Autofocus"), "Status": v("s", "Active"), "WindowId": v("u", 0),
+            "IconName": v("s", ""),
             "OverlayIconName": v("s", ""), "AttentionIconName": v("s", ""),
-            "ToolTip": v("(sa(iiay)ss)", ("", [], "Webcam Autofokus", self.tip)),
+            "ToolTip": v("(sa(iiay)ss)", ("", [], "Webcam Autofocus", self.tip)),
             "ItemIsMenu": v("b", False), "Menu": v("o", MENU_PATH),
         }.get(prop)
 
@@ -179,14 +185,14 @@ class TrayIcon:
 
     # ---------- dbusmenu ----------
     def _items(self):
-        """(id, Eigenschaften) der Menüeinträge; id 0 ist die Wurzel."""
+        """(id, properties) of the menu entries; id 0 is the root."""
         v = GLib.Variant
         def item(label):
             return {"label": v("s", label), "type": v("s", "standard"), "enabled": v("b", True), "visible": v("b", True)}
 
-        return [(2, item(self.toggle_label)), (1, item("Fenster öffnen")),
+        return [(2, item(self.toggle_label)), (1, item("Open window")),
                 (3, {"type": v("s", "separator"), "enabled": v("b", True), "visible": v("b", True)}),
-                (4, item("Beenden"))]
+                (4, item("Quit"))]
 
     def _menu_get(self, conn, sender, path, iface, prop):
         v = GLib.Variant
@@ -203,7 +209,7 @@ class TrayIcon:
     def _menu_call(self, conn, sender, path, iface, method, params, invocation):
         v = GLib.Variant
         if method == "GetLayout":
-            children = [v("(ia{sv}av)", (i, props, [])) for i, props in self._items()]    # av boxt selbst: nicht doppelt verpacken
+            children = [v("(ia{sv}av)", (i, props, [])) for i, props in self._items()]    # av boxes by itself: do not wrap twice
             invocation.return_value(v("(u(ia{sv}av))", (self.revision, (0, {"children-display": v("s", "submenu")}, children))))
         elif method == "GetGroupProperties":
             ids = params.unpack()[0]
@@ -242,27 +248,35 @@ class TrayIcon:
 
 class MainWindow(Adw.ApplicationWindow):
     def __init__(self, app, engine):
-        super().__init__(application=app, title="Webcam Autofokus", default_width=460)
+        super().__init__(application=app, title="Webcam Autofocus", default_width=460)
         self.engine, self.app = engine, app
-        self._disp = float(engine.a.fmin)       # angezeigte Knopfposition (gleitet zum Fokuswert)
+        self._disp = float(engine.a.fmin)       # displayed knob position (glides to the focus value)
         self._syncing = False
 
         header = Adw.HeaderBar()
-        self.switch = Gtk.Switch(valign=Gtk.Align.CENTER, tooltip_text="Autofokus ein/aus")
+        self.switch = Gtk.Switch(valign=Gtk.Align.CENTER, tooltip_text="Autofocus on/off")
         self.switch.connect("notify::active", self._on_switch)
         header.pack_start(self.switch)
-        self.preview_btn = Gtk.ToggleButton(label="Vorschau", tooltip_text="Zeigt das Bild, das in Zoom ankommt")
+        self.preview_btn = Gtk.ToggleButton(label="Preview", tooltip_text="Shows the image that arrives in Zoom")
         self.preview_btn.connect("toggled", self._on_preview)
         header.pack_end(self.preview_btn)
+
+        self.cams = []                          # cameras in the dropdown (same order)
+        self.cam_row = Adw.ComboRow(title="Camera")
+        self.cam_row.connect("notify::selected", self._on_camera)
+        self._cam_t = 0.0
+        self._fill_cameras()
+        cam_group = Adw.PreferencesGroup(margin_start=12, margin_end=12, margin_top=12)
+        cam_group.add(self.cam_row)
 
         self.banner = Adw.Banner(title="", revealed=False)
         self.picture = Gtk.Picture(content_fit=Gtk.ContentFit.CONTAIN, can_shrink=True)
         self.picture.set_size_request(-1, 250)
-        hint = Gtk.Label(label="Autofokus einschalten, um die Vorschau zu sehen", css_classes=["dim-label"])
+        hint = Gtk.Label(label="Turn autofocus on to see the preview", css_classes=["dim-label"])
         self.pv_stack = Gtk.Stack()
         self.pv_stack.add_named(self.picture, "pic")
         self.pv_stack.add_named(hint, "hint")
-        self.overlay_chk = Gtk.CheckButton(label="Gesichtsrahmen zeigen", halign=Gtk.Align.START, margin_start=2)
+        self.overlay_chk = Gtk.CheckButton(label="Show face frame", halign=Gtk.Align.START, margin_start=2)
         self.overlay_chk.connect("toggled", lambda c: setattr(self.engine, "preview_overlay", c.get_active()))
         pv_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, margin_start=12, margin_end=12, margin_top=12)
         pv_box.append(self.pv_stack)
@@ -285,24 +299,41 @@ class MainWindow(Adw.ApplicationWindow):
         self.every.set_value_pos(Gtk.PositionType.RIGHT)
         for m in (1, 5, 10, 20, 30):
             self.every.add_mark(m, Gtk.PositionType.BOTTOM, str(m))
-        self.every.set_tooltip_text("Nur jedes x-te Bild auswerten (1 = jedes). Höher = weniger CPU, trägere Reaktion.")
+        self.every.set_tooltip_text("Evaluate only every n-th frame (1 = every frame). Higher = less CPU, slower reaction.")
         self.every.connect("value-changed", lambda s: setattr(engine.a, "eval_every", int(s.get_value())))
         ev_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2, margin_start=12, margin_end=12, margin_top=12)
-        self.dyn = Gtk.CheckButton(label="dynamisch (nach CPU-Last)", active=engine.a.dynamic)
-        self.dyn.set_tooltip_text("Der Regler wird automatisch verschoben: hohe CPU-Last des Programms → seltener auswerten, wenig Last → öfter.")
+        self.dyn = Gtk.CheckButton(label="dynamic (by CPU load)", active=engine.a.dynamic)
+        self.dyn.set_tooltip_text("The slider is moved automatically: high CPU load of the program → evaluate less often, low load → more often.")
         self.dyn.connect("toggled", lambda b: setattr(engine.a, "dynamic", b.get_active()))
         head = Gtk.Box(spacing=12)
-        head.append(Gtk.Label(label="Auswertung: nur jedes x-te Bild", halign=Gtk.Align.START, hexpand=True))
+        head.append(Gtk.Label(label="Evaluation: only every n-th frame", halign=Gtk.Align.START, hexpand=True))
         head.append(self.dyn)
         ev_box.append(head)
         ev_box.append(self.every)
-        for w in (self.banner, self.revealer, ev_box, self.slider, self.graph, self.status, self.log):
+        for w in (self.banner, cam_group, self.revealer, ev_box, self.slider, self.graph, self.status, self.log):
             box.append(w)
         view = Adw.ToolbarView()
         view.add_top_bar(header)
         view.set_content(box)
         self.set_content(view)
-        self.connect("close-request", lambda w: (w.set_visible(False), True)[1])   # nur verstecken
+        self.set_hide_on_close(True)                                                # closing only hides the window
+
+    def _fill_cameras(self):
+        """Fill the dropdown with the cameras; the one chosen in the engine stays selected."""
+        cams = cameras.list_cameras()
+        if cams == self.cams:
+            return
+        self.cams = cams
+        self._syncing = True
+        self.cam_row.set_model(Gtk.StringList.new([c.name for c in cams]))
+        cur = self.engine.cam
+        self.cam_row.set_selected(next((i for i, c in enumerate(cams) if cur and c.name == cur.name), 0))
+        self._syncing = False
+
+    def _on_camera(self, row, _pspec):
+        i = row.get_selected()
+        if not self._syncing and 0 <= i < len(self.cams) and self.cams[i] != self.engine.cam:
+            self.app.select_camera(self.cams[i])
 
     def _on_switch(self, switch, _pspec):
         if not self._syncing:
@@ -313,7 +344,7 @@ class MainWindow(Adw.ApplicationWindow):
         self.engine.preview_on = btn.get_active()
 
     def sync(self):
-        """Vom Timer aufgerufen: Schalter, Banner und Texte an den Engine-Zustand angleichen."""
+        """Called by the timer: sync switch, banner and texts with the engine state."""
         e = self.engine
         self._syncing = True
         self.switch.set_active(e.active)
@@ -321,12 +352,20 @@ class MainWindow(Adw.ApplicationWindow):
         self.banner.set_title(e.error or "")
         self.banner.set_revealed(bool(e.error))
         if not self.is_visible():
-            e.preview_on = False                               # Fenster zu: kein Vorschaubild berechnen
+            e.preview_on = False                               # window closed: do not compute a preview image
             return
         e.preview_on = self.preview_btn.get_active()
+        if time.time() - self._cam_t > 3:                      # camera plugged/unplugged?
+            self._cam_t = time.time()
+            self._fill_cameras()
+        if e.virtual_name:
+            self.cam_row.set_subtitle(f"Select in Zoom & co.: {e.virtual_name}")
         if e.a.dynamic and int(self.every.get_value()) != e.a.eval_every:
-            self.every.set_value(e.a.eval_every)             # Regler folgt der automatischen Anpassung
+            self.every.set_value(e.a.eval_every)             # slider follows the automatic adjustment
         if e.preview_on:
+            shown = self.picture.get_width() * self.get_scale_factor()
+            if shown > 0:                                      # only deliver as many pixels as the window shows (sharp, but smooth)
+                e.preview_width = max(320, min(1280, shown))
             if e.active and e.preview and e.preview_t != self._pv_t:
                 self._pv_t = e.preview_t
                 w, h, data = e.preview
@@ -336,7 +375,7 @@ class MainWindow(Adw.ApplicationWindow):
         self._disp += (e.focus - self._disp) * 0.35
         face = f"{e.box[2]} px" if e.box else "—"
         sharp = f"{e.ema:.0f}" if e.ema is not None else "—"
-        self.status.set_text(f"{e.mode}  ·  Schärfe {sharp}  ·  Gesicht {face}")
+        self.status.set_text(f"{e.mode}  ·  Sharpness {sharp}  ·  Face {face}")
         self.log.set_text("\n".join(list(e.log)[-6:]))
         self.slider.queue_draw()
         self.graph.queue_draw()
@@ -345,7 +384,7 @@ class MainWindow(Adw.ApplicationWindow):
         e = self.engine
         if e.error:
             return RED
-        return ORANGE if e.mode == "suche Fokus" else GREEN
+        return ORANGE if e.mode == "searching focus" else GREEN
 
     def _draw_slider(self, area, cr, w, h):
         e = self.engine
@@ -355,7 +394,7 @@ class MainWindow(Adw.ApplicationWindow):
         frac = min(max((self._disp - lo) / (hi - lo), 0.0), 1.0)
         x = pad + frac * (w - 2 * pad)
         r, g, b = self._accent() if e.active else (fg.red, fg.green, fg.blue)
-        cr.set_line_cap(1)                                    # rund
+        cr.set_line_cap(1)                                    # round
         cr.set_line_width(7)
         cr.set_source_rgba(fg.red, fg.green, fg.blue, .22)
         cr.move_to(pad, y), cr.line_to(w - pad, y), cr.stroke()
@@ -378,7 +417,7 @@ class MainWindow(Adw.ApplicationWindow):
         if changed:
             cr.set_font_size(11)
             cr.set_source_rgba(r, g, b, 1)
-            cr.move_to(pad - 4, h - 4), cr.show_text("◀ Fokus geändert")
+            cr.move_to(pad - 4, h - 4), cr.show_text("◀ focus changed")
 
     def _draw_graph(self, area, cr, w, h):
         e = self.engine
@@ -395,9 +434,9 @@ class MainWindow(Adw.ApplicationWindow):
         cr.set_font_size(11)
         r, g, b = self._accent()
         cr.set_source_rgba(r, g, b, 1)
-        cr.move_to(4, 14), cr.show_text("■ Schärfe")
+        cr.move_to(4, 14), cr.show_text("■ Sharpness")
         cr.set_source_rgba(fg.red, fg.green, fg.blue, .8)
-        cr.move_to(80, 14), cr.show_text("— Fokus")
+        cr.move_to(80, 14), cr.show_text("— Focus")
         if len(hist) < 2:
             return
         xs = [w * (1 - (now - p[0]) / GRAPH_SECONDS) for p in hist]
@@ -405,7 +444,7 @@ class MainWindow(Adw.ApplicationWindow):
         span = e.a.fmax - e.a.fmin
         sharp = [bottom - (p[2] / smax) * (bottom - top - 4) for p in hist]
         focus = [bottom - ((p[1] - e.a.fmin) / span) * (bottom - top - 4) for p in hist]
-        cr.set_source_rgba(r, g, b, .25)                       # Schärfe als Fläche + Linie
+        cr.set_source_rgba(r, g, b, .25)                       # sharpness as area + line
         cr.move_to(xs[0], bottom)
         for x, y in zip(xs, sharp):
             cr.line_to(x, y)
@@ -428,20 +467,27 @@ class App(Adw.Application):
         self.window = None
         self.tray = None
         self._last_error = None
+        self._tick_error = None
 
     def do_startup(self):
         Adw.Application.do_startup(self)
-        self.hold()                                            # läuft weiter, wenn das Fenster zu ist
+        self.hold()                                            # keeps running when the window is closed
         self.tray = TrayIcon(on_activate=self.toggle, on_secondary=self.show_window, on_quit=self.quit)
         GLib.timeout_add(100, self._tick)
+        for sig in (signal.SIGTERM, signal.SIGHUP):            # kill, logout, closed terminal: quit properly, so that
+            GLib.unix_signal_add(GLib.PRIORITY_HIGH, sig, self._on_signal)   # do_shutdown hands the camera back to its autofocus
         if self.autostart:
             self.engine.start()
 
+    def _on_signal(self):
+        self.quit()
+        return GLib.SOURCE_REMOVE
+
     def do_activate(self):
         first, self._first_activate = self._first_activate, False
-        if first and self.hidden:                              # --hidden (z. B. Autostart): nur das Icon
+        if first and self.hidden:                              # --hidden (e.g. autostart): icon only
             return
-        self.show_window()                                     # Start aus dem Menü / erneuter Aufruf: Fenster zeigen
+        self.show_window()                                     # started from the menu / invoked again: show window
 
     def show_window(self):
         if self.window is None:
@@ -455,39 +501,57 @@ class App(Adw.Application):
         if on and not self.engine.active:
             self.engine.start()
         elif not on and self.engine.active:
-            threading.Thread(target=self.engine.stop, daemon=True).start()   # Stop wartet auf den Thread
+            threading.Thread(target=self.engine.stop, daemon=True).start()   # stop waits for the thread
+
+    def select_camera(self, cam):
+        def work():
+            was_on = self.engine.active
+            self.engine.stop()
+            self.engine.set_camera(cam)
+            if was_on:
+                self.engine.start()
+        threading.Thread(target=work, daemon=True).start()
 
     def _tick(self):
+        try:
+            self._refresh()
+        except Exception:
+            msg = traceback.format_exc()
+            if msg != self._tick_error:                        # a failing tick must not stop the timer (frozen icon);
+                self._tick_error = msg                         # print each distinct failure once, not ten times a second
+                sys.stderr.write(msg)
+        return True
+
+    def _refresh(self):
         e = self.engine
         if e.error:
             icon, tip = ICON_ERR, e.error
         elif e.active:
-            icon, tip = ICON_ON, f"Fokus {e.focus} · {e.mode}"
+            icon, tip = ICON_ON, f"Focus {e.focus} · {e.mode}"
         else:
-            icon, tip = ICON_OFF, "Autofokus aus"
-        self.tray.update(icon, tip, "Autofokus ausschalten" if e.active else "Autofokus einschalten")
+            icon, tip = ICON_OFF, "Autofocus off"
+        self.tray.update(icon, tip, "Turn autofocus off" if e.active else "Turn autofocus on")
         if e.error and e.error != self._last_error:
-            note = Gio.Notification.new("Webcam Autofokus")
+            note = Gio.Notification.new("Webcam Autofocus")
             note.set_body(e.error)
             self.send_notification("error", note)
         self._last_error = e.error
         if self.window:
             self.window.sync()
-        return True
 
     def do_shutdown(self):
-        self.engine.stop()                                     # Kamera freigeben, Autofokus zurückschalten
+        self.engine.stop()                                     # release the camera, switch autofocus back on
         Adw.Application.do_shutdown(self)
 
 
 def main():
-    p = argparse.ArgumentParser(description="Webcam-Autofokus als Tray-App")
+    p = argparse.ArgumentParser(description="Webcam autofocus as a tray app")
     add_config_args(p)
-    p.add_argument("--start", action="store_true", help="Autofokus sofort einschalten")
-    p.add_argument("--hidden", action="store_true", help="beim Start kein Fenster zeigen, nur das Panel-Icon")
+    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    p.add_argument("--start", action="store_true", help="turn autofocus on immediately")
+    p.add_argument("--hidden", action="store_true", help="do not show a window at startup, only the panel icon")
     args = p.parse_args()
-    cfg = Config(**{f.name: getattr(args, f.name) for f in dataclasses.fields(Config)})
-    app = App(cfg, autostart=args.start, hidden=args.hidden)
+    app = App(config_from_args(args), autostart=args.start, hidden=args.hidden)
     sys.exit(app.run([sys.argv[0]]))
 
 
