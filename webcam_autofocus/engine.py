@@ -457,7 +457,7 @@ class AutoFocus:
             for v in range(self.a.fmin, self.a.fmax + 1, self.a.coarse):
                 score(v)
                 top = max(scores.values())
-                if top > 2 * min(scores.values()) and score_run_low(top):   # clearly past the peak: the rest is blur
+                if top > 4 * min(scores.values()) and score_run_low(top):   # clearly past a real peak (not a bump in the blur): the rest is blur
                     break
             top = max(scores, key=scores.get)
             for v in (top - 10, top + 10, top + 20):
