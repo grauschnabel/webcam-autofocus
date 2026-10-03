@@ -163,6 +163,31 @@ class Search(unittest.TestCase):
             self.assertGreater(min(visited), 40)            # and it did not run off in the wrong direction
 
 
+    def test_the_peak_between_two_steps_is_found_by_interpolation(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(engine, "CALIB_DIR", Path(tmp)):
+            e = engine_with_fake_lens(tmp, best=147)
+            e.measure = lambda box, n=2: 1000.0 * np.exp(-((e.focus - 147) / 40.0) ** 2)   # smooth, like the real curve
+            e.focus, e.ref, e.ref_w = 100, 500.0, 200
+            e.box = (500, 200, 200, 240)
+            moves = []
+            move = e.set_focus
+            e.set_focus = lambda v: (move(v), moves.append(e.focus))
+            e.search(e.box, "face closer/farther")
+            self.assertAlmostEqual(e.focus, 147, delta=3)
+            self.assertLess(len(moves), 14)
+
+    def test_the_final_approach_comes_from_below(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(engine, "CALIB_DIR", Path(tmp)):
+            e = engine_with_fake_lens(tmp, best=100)
+            e.measure = lambda box, n=2: 1000.0 * np.exp(-((e.focus - 100) / 40.0) ** 2)
+            e.focus, e.ref, e.ref_w = 160, 500.0, 200         # coming from above
+            e.box = (500, 200, 200, 240)
+            moves = []
+            move = e.set_focus
+            e.set_focus = lambda v: (move(v), moves.append(e.focus))
+            e.search(e.box, "face closer/farther")
+            self.assertLessEqual(moves[-2], moves[-1])             # the last move is upwards
+
 class Run(unittest.TestCase):
     def test_waiting_for_a_face_starts_with_the_run(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -278,12 +303,12 @@ class FocusRange(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             e = make_engine(tmp, small)
         self.assertEqual((e.a.fmin, e.a.fmax), (1, 150))
-        self.assertLess(e.a.coarse, 30)
+        self.assertLess(e.a.coarse, 20)
 
     def test_defaults_without_camera(self):
         with tempfile.TemporaryDirectory() as tmp:
             e = make_engine(tmp)
-        self.assertEqual((e.a.fmin, e.a.fmax, e.a.coarse), (1, 300, 30))
+        self.assertEqual((e.a.fmin, e.a.fmax, e.a.coarse), (1, 300, 20))
 
 
 if __name__ == "__main__":

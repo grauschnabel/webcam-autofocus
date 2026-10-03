@@ -3,6 +3,7 @@ virtual camera (v4l2loopback). No UI of its own — the displays (terminal, tray
 only read the state (mode, focus, ema, box, log, history, error)."""
 import glob
 import json
+import math
 import os
 import subprocess
 import threading
@@ -17,6 +18,7 @@ import numpy as np
 from . import cameras
 
 AUTO = "focus_automatic_continuous"
+FINE_STEP = 10                                           # the parabola takes over below this step size
 CALIB_DIR = Path.home() / ".cache" / "webcam-autofocus"   # one calibration file per camera (v2: points with sharpness value)
 
 
@@ -29,7 +31,7 @@ class Config:
     height: int = 720
     fmin: int = 1
     fmax: int = 300
-    coarse: int = 30                   # step size of the coarse search
+    coarse: int = 20                   # step size of the coarse search
     climb: int = 40                    # initial step size when refocusing
     settle: float = 0.2                # seconds to wait after a focus change
     size_tol: float = 0.15             # face width ± beyond which to refocus
@@ -94,6 +96,7 @@ class AutoFocus:
         self.a = cfg or Config()
         self.on_frame = None               # hook, called per camera frame (the display throttles itself)
         self.error = None
+        self.lens_known = False
         self.confirm_create = False        # a UI sets this to be asked before a password dialog (see _virtual)
         self.need_virtual = False          # set when the virtual camera is missing and the UI should ask
         self._thread = None
@@ -154,6 +157,7 @@ class AutoFocus:
         self.ema = None
         self.bad_since = None
         self.cooldown = 0.0
+        self.lens_known = False    # the camera's own autofocus moved the lens: where it is, we do not know
         self.freeze = None         # still image during the search
         self.verify_at = None      # time of the check after a prediction
         self.recheck_at = None     # next regular check
@@ -323,15 +327,22 @@ class AutoFocus:
         self.preview_t = now
 
     def set_focus(self, value):
+        """Move the lens and wait until it has arrived. The motor needs about 1 s for 60 units and 0.3 s for
+        10 (more than a second for a long jump), and it starts a moment late, so a picture that merely looks
+        steady is no proof. Whatever is read earlier is the blur of the lens on its way."""
         value = self._clamp(value)
+        jump = abs(value - self.focus) if self.lens_known else self.a.fmax - self.a.fmin   # unknown after the camera's own autofocus
         v4l2(self.dev, focus_absolute=value)
-        self.focus = value
-        end = time.time() + self.a.settle      # let the focus motor run, drain the buffer
-        while time.time() < end:
+        self.focus, self.lens_known = value, True
+        end = time.time() + min(1.8, self.a.settle + .012 * jump)
+        while time.time() < end:                 # drain the buffer meanwhile
             self.grab()
 
-    def measure(self, box, n=2):
-        return float(np.median([sharpness(self.grab(), box) for _ in range(n)]))
+    def measure(self, box, n=4):
+        """Sharpness at the current focus. Movement of the head only ever blurs, so of n frames the best two
+        count (their mean); the median would follow every dip."""
+        vals = sorted(sharpness(self.grab(), box) for _ in range(n))
+        return float(np.mean(vals[-2:]))
 
     def find_face(self, frame):
         s = 480 / self.w
@@ -387,21 +398,36 @@ class AutoFocus:
 
         def climb(start, step, first_dir=1):
             """Step, compare, decide: a step that makes the picture sharper is followed by the next one in
-            the same direction; one that does not turns around. Once both sides of the best value have been
-            tried at a step size, the step is halved. Ends when the step is too small to matter."""
-            best, direction, turns = start, first_dir, 0
+            the same direction; if it does not, the other side is tried once. When both sides are worse the
+            peak is bracketed: continue with half the step, and at the end put a parabola through the three
+            points around the best one instead of creeping closer."""
+            best, direction = start, first_dir
             score(best)
             for _ in range(40):                              # upper limit, the loop normally ends on its own
-                if step < 5:
-                    break
-                cand = best + direction * step
-                if self.a.fmin <= cand <= self.a.fmax and score(cand) > scores[best] * 1.03:
-                    best = cand                              # sharper: keep going this way
+                moved = False
+                for d in (direction, -direction):
+                    cand = best + d * step
+                    if self.a.fmin <= cand <= self.a.fmax and score(cand) > scores[best] * 1.08:
+                        best, direction, moved = cand, d, True
+                        break
+                if moved:
                     continue
-                direction, turns = -direction, turns + 1     # not sharper (or the end of the range): turn around
-                if turns % 2 == 0:
-                    step //= 2                               # tried both sides at this step size: finer
-            return best
+                if step <= FINE_STEP:
+                    break
+                step //= 2
+            lo, hi = scores.get(best - step), scores.get(best + step)
+            if lo and hi and lo > 0 and hi > 0 and scores[best] > 0:    # vertex of a parabola through log(sharpness)
+                l, m, h = math.log(lo), math.log(scores[best]), math.log(hi)
+                curv = l - 2 * m + h
+                if curv < 0:
+                    best = self._clamp(best + round(step * (l - h) / (2 * curv)))
+                    score(best)
+            return max(scores, key=scores.get) if scores[best] < max(scores.values()) * .9 else best
+
+        def score_run_low(top):
+            """The last two measurements are far below the best one."""
+            last = list(scores.values())[-2:]
+            return len(last) == 2 and all(x < .35 * top for x in last)
 
         def peak(v):
             """Real peak? The value must be clearly sharper than the worst one we tried."""
@@ -427,8 +453,13 @@ class AutoFocus:
         if center is None:                                   # initial focus/fallback: sweep the whole range coarsely
             for v in range(self.a.fmin, self.a.fmax + 1, self.a.coarse):
                 score(v)
+                top = max(scores.values())
+                if top > 2 * min(scores.values()) and score_run_low(top):   # clearly past the peak: the rest is blur
+                    break
             center = refine(max(scores, key=scores.get), self.a.coarse // 2)
         trusted = peak(center)
+        if self.focus > center + 5:                          # always arrive from below: the lens has play,
+            self.set_focus(max(self.a.fmin, center - 20))    # the same value is a different focus from above
         self.set_focus(center)
         self.freeze = None
         self.ref = self.measure(box, 8)

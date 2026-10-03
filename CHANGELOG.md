@@ -11,6 +11,10 @@ the project uses [Semantic Versioning](https://semver.org/).
   one in the same direction, a step that does not turns around, and the step size is halved once
   both sides have been tried. The regular check no longer moves the lens while the picture is
   still sharp.
+- The lens is given time to arrive after every move (about 1 s per 60 units), so the search no longer
+  measures the blur of the moving lens and no longer jumps up and down. The final approach always
+  comes from below because the lens has play, the peak is interpolated with a parabola, and the
+  first sweep uses finer steps and stops once it is past the peak.
 - Before a password dialog for creating the virtual camera, the tray app explains why
   administrator rights are needed and offers the equivalent terminal command to copy. If polkit
   already allows it, the camera is created without asking.
