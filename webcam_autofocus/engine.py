@@ -19,7 +19,6 @@ from . import cameras
 
 AUTO = "focus_automatic_continuous"
 FINE_STEP = 10                                           # the parabola takes over below this step size
-MOVED_TOL = .12                                           # relative change of the face width that makes a running search obsolete
 CALIB_DIR = Path.home() / ".cache" / "webcam-autofocus"   # one calibration file per camera (v2: points with sharpness value)
 
 
@@ -55,13 +54,6 @@ class EngineError(Exception):
 
 class Stopped(Exception):
     pass
-
-
-class Moved(Exception):
-    """The face changed its size while the search measured: the values so far belong to another distance."""
-    def __init__(self, box):
-        super().__init__("face moved")
-        self.box = box
 
 
 def v4l2(dev, **ctrls):
@@ -105,7 +97,6 @@ class AutoFocus:
         self.on_frame = None               # hook, called per camera frame (the display throttles itself)
         self.error = None
         self.lens_known = False
-        self._follow = True                # a size change of the face aborts a running search (Moved)
         self.confirm_create = False        # a UI sets this to be asked before a password dialog (see _virtual)
         self.need_virtual = False          # set when the virtual camera is missing and the UI should ask
         self._thread = None
@@ -349,23 +340,8 @@ class AutoFocus:
 
     def measure(self, box, n=3):
         """Sharpness at the current focus. Movement of the head only ever blurs, so of n frames the best two
-        count (their mean); the median would follow every dip. The face is looked for in every frame: the
-        measurement follows it, is repeated while the head is moving, and a clearly changed size
-        (you leaned in or out) ends the search with Moved, because the peak is somewhere else now."""
-        for attempt in range(3):
-            vals, widths = [], []
-            for _ in range(n):
-                frame = self.grab()
-                found = self.find_face(frame)
-                vals.append(sharpness(frame, found or box))
-                if found:
-                    widths.append(found[2])
-                    last = found
-            if widths and self._follow and abs(widths[-1] / box[2] - 1) > MOVED_TOL:
-                raise Moved(last)
-            if len(widths) < 2 or max(widths) / min(widths) < 1.06 or attempt == 2:
-                break                                        # the head was still (or does not stop): take it
-        vals.sort()
+        count (their mean); the median would follow every dip."""
+        vals = sorted(sharpness(self.grab(), box) for _ in range(n))
         return float(np.mean(vals[-2:]))
 
     def find_face(self, frame):
@@ -504,20 +480,6 @@ class AutoFocus:
             self.verify_at = time.time() + self.a.verify_delay
         self.mode = "tracking face"
 
-    def _search_following(self, box, reason):
-        """Search; if you move meanwhile, start again with the new face size (the old size shows the
-        direction), at most three times, then with the face as it is."""
-        for attempt in range(4):
-            self._follow = attempt < 3
-            try:
-                self.search(box, reason)
-                break
-            except Moved as m:
-                self.log.append(f"{time.strftime('%H:%M:%S')}  Face moved {box[2]} → {m.box[2]} px, searching again")
-                box, reason = m.box, "face moved"
-                self.box = box
-        self._follow = True
-
     def needs_refocus(self, box, now):
         """When to refocus? First measurement, face clearly closer/farther, or sharpness dropped."""
         if self.ref is None:
@@ -590,7 +552,7 @@ class AutoFocus:
                     else:
                         self.recheck_at = now + self.a.recheck
                 if reason:
-                    self._search_following(box, reason)
+                    self.search(box, reason)
         except Stopped:
             pass
         finally:

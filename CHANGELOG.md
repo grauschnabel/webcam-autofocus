@@ -7,9 +7,6 @@ the project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Changed
-- The search notices when you move: the face is tracked in every measured frame, a measurement
-  during head movement is repeated, and if the face size changes clearly (leaning in or out) the
-  search starts again with the new size instead of finishing for a distance you have left.
 - The focus search is systematic: a step that makes the picture sharper is followed by the next
   one in the same direction, a step that does not turns around, and the step size is halved once
   both sides have been tried. The regular check no longer moves the lens while the picture is

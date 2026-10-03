@@ -188,37 +188,6 @@ class Search(unittest.TestCase):
             e.search(e.box, "face closer/farther")
             self.assertLessEqual(moves[-2], moves[-1])             # the last move is upwards
 
-class Movement(unittest.TestCase):
-    def measure_with_faces(self, faces):
-        with tempfile.TemporaryDirectory() as tmp:
-            e = engine_with_fake_lens(tmp)
-            del e.measure                                    # the real one, with fake frames and faces
-            e.grab = lambda: np.full((720, 1280, 3), 128, np.uint8)
-            it = iter(faces)
-            e.find_face = lambda frame: next(it)
-            return e, e.measure((500, 200, 200, 240))
-
-    def test_leaning_in_ends_the_search(self):
-        with self.assertRaises(engine.Moved) as m:
-            self.measure_with_faces([(500, 200, 200, 240), (480, 190, 230, 270), (460, 170, 260, 300)])
-        self.assertEqual(m.exception.box[2], 260)
-
-    def test_small_movement_is_no_reason(self):
-        self.measure_with_faces([(500, 200, 200, 240)] * 3)
-
-    def test_head_in_motion_is_measured_again(self):
-        faces = [(500, 200, 200, 240), (500, 200, 190, 230), (500, 200, 210, 250)] + [(500, 200, 200, 240)] * 3
-        calls = []
-        with tempfile.TemporaryDirectory() as tmp:
-            e = engine_with_fake_lens(tmp)
-            del e.measure
-            e.grab = lambda: calls.append(1) or np.full((720, 1280, 3), 128, np.uint8)
-            it = iter(faces)
-            e.find_face = lambda frame: next(it)
-            e.measure((500, 200, 200, 240))
-        self.assertEqual(len(calls), 6)
-
-
 class Run(unittest.TestCase):
     def test_waiting_for_a_face_starts_with_the_run(self):
         with tempfile.TemporaryDirectory() as tmp:
