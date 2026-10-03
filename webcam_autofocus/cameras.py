@@ -93,6 +93,11 @@ def list_cameras():
     return cams
 
 
+def unsupported():
+    """Names of cameras that are present but have no manual focus (nothing to control, so not offered)."""
+    return [_clean(raw) for dev, raw in _sources() if not _focus_range(dev, raw)]
+
+
 def find_camera(dev=None, name=None):
     """Camera by device path or name; without either, the saved choice, otherwise the first one."""
     cams = list_cameras()

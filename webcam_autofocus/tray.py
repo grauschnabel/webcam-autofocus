@@ -265,9 +265,11 @@ class MainWindow(Adw.ApplicationWindow):
         self.cam_row = Adw.ComboRow(title="Camera")
         self.cam_row.connect("notify::selected", self._on_camera)
         self._cam_t = 0.0
+        self.cam_note = Gtk.Label(xalign=0, wrap=True, margin_top=6, margin_start=4, css_classes=["dim-label", "caption"])
         self._fill_cameras()
         cam_group = Adw.PreferencesGroup(margin_start=12, margin_end=12, margin_top=12)
         cam_group.add(self.cam_row)
+        cam_group.add(self.cam_note)
 
         self.banner = Adw.Banner(title="", revealed=False)
         self.picture = Gtk.Picture(content_fit=Gtk.ContentFit.CONTAIN, can_shrink=True)
@@ -324,6 +326,10 @@ class MainWindow(Adw.ApplicationWindow):
         if cams == self.cams:
             return
         self.cams = cams
+        skipped = cameras.unsupported()
+        self.cam_note.set_visible(bool(skipped))
+        self.cam_note.set_label(", ".join(skipped) + (" has" if len(skipped) == 1 else " have") +
+                                " no manual focus, so there is nothing to control and it is not listed.")
         self._syncing = True
         self.cam_row.set_model(Gtk.StringList.new([c.name for c in cams]))
         cur = self.engine.cam
@@ -347,7 +353,7 @@ class MainWindow(Adw.ApplicationWindow):
         """Called by the timer: sync switch, banner and texts with the engine state."""
         e = self.engine
         self._syncing = True
-        self.switch.set_active(e.active)
+        self.switch.set_active(e.on)
         self._syncing = False
         self.banner.set_title(e.error or "")
         self.banner.set_revealed(bool(e.error))
@@ -434,9 +440,11 @@ class MainWindow(Adw.ApplicationWindow):
         cr.set_font_size(11)
         r, g, b = self._accent()
         cr.set_source_rgba(r, g, b, 1)
-        cr.move_to(4, 14), cr.show_text("■ Sharpness")
+        cr.rectangle(4, 6, 8, 8), cr.fill()                  # legend swatch (no glyph: not every font has "■")
+        cr.move_to(16, 14), cr.show_text("Sharpness")
         cr.set_source_rgba(fg.red, fg.green, fg.blue, .8)
-        cr.move_to(80, 14), cr.show_text("— Focus")
+        cr.rectangle(90, 9, 12, 2), cr.fill()
+        cr.move_to(106, 14), cr.show_text("Focus")
         if len(hist) < 2:
             return
         xs = [w * (1 - (now - p[0]) / GRAPH_SECONDS) for p in hist]
@@ -497,13 +505,17 @@ class App(Adw.Application):
         self.window.present()
 
     def toggle(self):
-        self.set_enabled(not self.engine.active)
+        self.set_enabled(not self.engine.on)
 
     def set_enabled(self, on):
-        if on and not self.engine.active:
-            self.engine.start()
-        elif not on and self.engine.active:
-            threading.Thread(target=self.engine.stop, daemon=True).start()   # stop waits for the thread
+        e = self.engine
+        if on and not e.on:
+            if e.active:                                       # still shutting down: finish that first
+                threading.Thread(target=lambda: (e.stop(), e.start()), daemon=True).start()
+            else:
+                e.start()
+        elif not on and e.on:
+            threading.Thread(target=e.stop, daemon=True).start()   # stop waits for the thread
 
     def select_camera(self, cam):
         def work():
@@ -574,11 +586,11 @@ class App(Adw.Application):
             self.ask_create_virtual()
         if e.error:
             icon, tip = ICON_ERR, e.error
-        elif e.active:
+        elif e.on:
             icon, tip = ICON_ON, f"Focus {e.focus} · {e.mode}"
         else:
             icon, tip = ICON_OFF, "Autofocus off"
-        self.tray.update(icon, tip, "Turn autofocus off" if e.active else "Turn autofocus on")
+        self.tray.update(icon, tip, "Turn autofocus off" if e.on else "Turn autofocus on")
         if e.error and e.error != self._last_error:
             note = Gio.Notification.new("Webcam Autofocus")
             note.set_body(e.error)

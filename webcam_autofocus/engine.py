@@ -552,6 +552,12 @@ class AutoFocus:
             self._thread.join(timeout=5)
 
     @property
+    def on(self):
+        """What the user asked for: running and not being stopped. The thread may need a moment to end
+        (stop() waits for it), but a switch or icon must not jump back to "on" during that time."""
+        return self.active and not self._stop.is_set()
+
+    @property
     def active(self):
         """True as long as the thread runs (also while the camera is being opened)."""
         return bool(self._thread and self._thread.is_alive())

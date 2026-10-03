@@ -16,6 +16,10 @@ the project uses [Semantic Versioning](https://semver.org/).
   already allows it, the camera is created without asking.
 
 ### Fixed
+- The switch in the window jumped back to "on" when switching off, because the engine needs a
+  moment to stop; the switch and the tray icon now follow what was asked for.
+- The window lists cameras without manual focus that are not offered, and the legend of the
+  sharpness graph no longer depends on a font having a "■" glyph.
 - Names of virtual cameras are cut to the 31 characters v4l2loopback keeps. A longer camera
   name (for example "C922 Pro Stream Webcam") was never found again, so autofocus could not
   be switched on and every attempt created another virtual camera.

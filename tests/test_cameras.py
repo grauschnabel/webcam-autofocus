@@ -129,6 +129,19 @@ class Password(unittest.TestCase):
                     self.assertTrue(cameras.needs_password())
 
 
+class Unsupported(unittest.TestCase):
+    def test_cameras_without_focus_are_named_but_not_offered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            make_node(root, 0, "Integrated_Webcam_HD: Integrate")
+            make_node(root, 2, "Dell Webcam WB5023")
+            ranges = {"/dev/video0": None, "/dev/video2": (1, 1000)}
+            with mock.patch.object(cameras, "SYSFS", root), \
+                    mock.patch.object(cameras, "_focus_range", lambda dev, raw: ranges[dev]):
+                self.assertEqual(cameras.unsupported(), ["Integrated Webcam HD"])
+                self.assertEqual([c.name for c in cameras.list_cameras()], ["Dell Webcam WB5023"])
+
+
 class FocusProbe(unittest.TestCase):
     OUT = "focus_absolute 0x009a090a (int)    : min=1 max=500 step=1 default=1 value=181\n"
 

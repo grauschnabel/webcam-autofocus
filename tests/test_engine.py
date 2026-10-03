@@ -2,6 +2,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -232,6 +233,24 @@ class MissingVirtualCamera(unittest.TestCase):
                     self.assertEqual(e._virtual(), "/dev/video9")
                 create.assert_called_once()
                 self.assertFalse(e.need_virtual)
+
+
+class OnOff(unittest.TestCase):
+    def test_a_switch_does_not_jump_back_while_the_engine_is_shutting_down(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            e = make_engine(tmp, CAM)
+            release = threading.Event()
+            e._thread = threading.Thread(target=release.wait)
+            e._thread.start()
+            try:
+                self.assertTrue(e.on)
+                e._stop.set()                                # stop() was requested, the thread is still ending
+                self.assertTrue(e.active)
+                self.assertFalse(e.on)
+            finally:
+                release.set()
+                e._thread.join()
+            self.assertFalse(e.on)
 
 
 class V4l2(unittest.TestCase):
