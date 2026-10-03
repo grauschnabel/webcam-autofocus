@@ -32,6 +32,7 @@ def engine_with_fake_lens(tmp, best=150):
     e.last = np.zeros((720, 1280, 3), np.uint8)
     e.set_focus = lambda value: setattr(e, "focus", int(min(max(value, e.a.fmin), e.a.fmax)))
     e.measure = lambda box, n=2: 1000.0 / (1 + abs(e.focus - best))
+    e.find_face = lambda frame: None
     return e
 
 
@@ -188,6 +189,30 @@ class Search(unittest.TestCase):
             entry = json.loads((Path(tmp) / "search.log").read_text().splitlines()[-1])
             self.assertEqual((entry["reason"], entry["outcome"], entry["start"]), ("face closer/farther", "done", 160))
             self.assertGreater(len(entry["points"]), 2)
+
+    def test_a_head_that_moved_during_the_search_is_not_trusted_and_triggers_another_search(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(engine, "CALIB_DIR", Path(tmp)):
+            e = engine_with_fake_lens(tmp, best=100)
+            e.measure = lambda box, n=2: 1000.0 * np.exp(-((e.focus - 100) / 40.0) ** 2)
+            e.find_face = lambda frame: (500, 200, 300, 360)        # 50 % wider than at the start
+            e.focus, e.ref, e.ref_w = 160, 500.0, 200
+            e.box = (500, 200, 200, 240)
+            e.search(e.box, "face closer/farther")
+            self.assertEqual(e.ref_w, 200)
+            self.assertEqual(e.box[2], 300)
+            self.assertEqual(e.calib, {})                       # nothing learned from a moving head
+            self.assertLess(e.cooldown, time.time() + 1)
+            t = time.time() + 1
+            self.assertIsNone(e.needs_refocus(e.box, t))                 # the new size must persist first
+            self.assertEqual(e.needs_refocus(e.box, t + 2), "face closer/farther")
+
+    def test_a_jumping_face_box_is_only_followed_once_confirmed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            e = make_engine(tmp, CAM)
+            e.box = (500, 200, 200, 240)
+            self.assertEqual(e._follow((505, 200, 200, 240))[2], 200)       # near: smoothed
+            self.assertEqual(e._follow((100, 50, 80, 90)), e.box)           # elsewhere: ignored once
+            self.assertEqual(e._follow((102, 52, 80, 90)), (102, 52, 80, 90))   # confirmed
 
     def test_the_local_search_never_turns_back_while_measuring(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(engine, "CALIB_DIR", Path(tmp)):

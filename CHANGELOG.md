@@ -6,6 +6,14 @@ the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- A head that moved during a search no longer teaches the model a wrong distance: the result is not
+  stored and a new search starts as soon as the new size has held for a moment.
+- The face box ignores a single detection that lies elsewhere (false hits, tilted head) until a
+  second one confirms it.
+- The cold start goes well below the peak before measuring its neighbours, so a long way back
+  through the lens' play no longer spoils those readings; the wait after long moves is up to 3 s.
+
 ### Added
 - Every focus search writes one line (reason, start and end focus, all measured points, duration,
   turns) to `~/.cache/webcam-autofocus/search.log`, to find out why a focus went wrong.

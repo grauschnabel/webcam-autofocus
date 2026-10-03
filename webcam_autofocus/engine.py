@@ -340,7 +340,7 @@ class AutoFocus:
         jump = abs(cmd - self._cmd) if self._cmd is not None else self.a.fmax - self.a.fmin   # unknown after the camera's own autofocus
         v4l2(self.dev, focus_absolute=cmd)
         self.focus, self.lens_known, self._cmd = value, True, cmd
-        end = time.time() + min(1.8, self.a.settle + .012 * jump)
+        end = time.time() + min(3.0, self.a.settle + .012 * jump)
         while time.time() < end:                 # drain the buffer meanwhile
             self.grab()
 
@@ -360,6 +360,27 @@ class AutoFocus:
             return None
         x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
         return tuple(int(v / s) for v in (x, y, w, h))
+
+    def _follow(self, found):
+        """New face box from a detection: smoothed if it lies where the old one is; a box somewhere else
+        (a false hit, a jump of the detector) is only taken over once a second detection confirms it."""
+        old, self._cand = self.box, getattr(self, "_cand", None)
+        if old is None or self._overlap(old, found) > .5:
+            self._cand = None
+            return found if old is None else tuple(int(.7 * o + .3 * f) for o, f in zip(old, found))
+        if self._cand is not None and self._overlap(self._cand, found) > .5:
+            self._cand = None
+            return found
+        self._cand = found
+        return old
+
+    @staticmethod
+    def _overlap(a, b):
+        """Intersection over union of two (x, y, w, h) boxes."""
+        w = min(a[0] + a[2], b[0] + b[2]) - max(a[0], b[0])
+        h = min(a[1] + a[3], b[1] + b[3]) - max(a[1], b[1])
+        inter = max(0, w) * max(0, h)
+        return inter / (a[2] * a[3] + b[2] * b[3] - inter)
 
     def _adapt(self, now):
         """Measure own CPU load every 3 s and adjust eval_every (too high -> evaluate less often)."""
@@ -486,20 +507,26 @@ class AutoFocus:
                 if top > 4 * min(scores.values()) and score_run_low(top):   # clearly past a real peak (not a bump in the blur): the rest is blur
                     break
             top = max(scores, key=scores.get)
+            self.set_focus(top - 60)                         # a long way back is imprecise (play): go well below, then only upwards
             for v in (top - 10, top + 10, top + 20):
                 score(v)
             center = finish(max(scores, key=scores.get), 10)
         trusted = peak(center)
         self.set_focus(center)
         self.freeze = None
+        now_box = self.find_face(self.last)                  # did the head move meanwhile? then the result belongs to another distance
+        moved = now_box is not None and abs(now_box[2] / box[2] - 1) > self.a.size_tol
+        if moved:
+            trusted = False
+            self.box = now_box
         self.ref = self.measure(box, 5)
         if trusted and self.box is not None:                 # only clear peaks of a really detected face into memory
             self.record(box[2], center, self.ref)
         self.recheck_at = time.time() + self.a.recheck if self.a.recheck else None
-        self.ref_w = box[2]
+        self.ref_w = box[2]                                  # stays the old width when moved, so the loop searches again
         self.ema = self.ref
         self.bad_since = None
-        self.cooldown = time.time() + self.a.cooldown
+        self.cooldown = time.time() + (0.5 if moved else self.a.cooldown)   # moved: look again soon, the loop sees the new size
         stamp = time.strftime('%H:%M:%S')
         if verify and center == old:
             self.log.append(f"{stamp}  Check: focus {center} is right")
@@ -555,8 +582,7 @@ class AutoFocus:
                     found = self.find_face(frame)
                     if found:
                         self.face_t = now
-                        self.box = found if self.box is None else tuple(
-                            int(.7 * o + .3 * f) for o, f in zip(self.box, found))
+                        self.box = self._follow(found)
                 if self.ref is not None and now - self.face_t > 2.5:   # face gone (head turned): hold focus, do not search again
                     self.box = None
                     self.bad_since = None
