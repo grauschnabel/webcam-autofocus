@@ -15,6 +15,9 @@ the project uses [Semantic Versioning](https://semver.org/).
   administrator rights are needed and offers the equivalent terminal command to copy. If polkit
   already allows it, the camera is created without asking.
 
+- The name of the virtual camera is a highlighted row in the window with a copy button, and the
+  README explains the virtual camera and how to use it in a video-call program.
+
 ### Fixed
 - The switch in the window jumped back to "on" when switching off, because the engine needs a
   moment to stop; the switch and the tray icon now follow what was asked for.

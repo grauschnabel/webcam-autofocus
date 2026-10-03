@@ -17,6 +17,28 @@ bookshelf or a poster, and leaves you blurry. They almost always offer a
 measures how sharp it is, and moves the focus to the sharpest position, all in
 the background and with little CPU.
 
+## How you use it: a second, virtual camera
+
+webcam-autofocus does not change your real camera, it sits between the camera and your
+video-call program:
+
+```
+  real camera ──► webcam-autofocus ──► virtual camera "<your camera> (Autofocus)" ──► Zoom, Teams, browser, OBS …
+  (blurry)         finds your face,      (the same picture, sharp on your face)
+                   sets the focus
+```
+
+- After you switch autofocus on, your system has **one more camera** named
+  **"&lt;your camera&gt; (Autofocus)"**. It is created automatically, you do not set anything up.
+- **In your video-call program, choose that camera** instead of the real one. That is the whole
+  trick: whatever program uses the virtual camera gets the sharp picture.
+- Only one program can use a real camera at a time, and webcam-autofocus is that program.
+  So the real camera cannot be selected in Zoom while autofocus is on, and that is intended.
+- The virtual camera only shows a picture while autofocus is **on**. Switch it off and the
+  camera goes dark; your real camera is handed back to its own autofocus.
+- The window shows the exact name of the virtual camera (with a copy button), because
+  v4l2loopback cuts names to 31 characters.
+
 ## Features
 
 - **Autofocus on the face, not the scene:** contrast autofocus measured only on
@@ -73,20 +95,24 @@ cd webcam-autofocus
 
 ## Usage
 
-1. Open the window (application menu or tray icon, middle click) and choose your
-   **camera**. Below it you see the name of the virtual camera.
-2. Switch autofocus **on** (switch in the window or left click on the tray icon).
-   The virtual camera is created automatically when it is needed (and again after
-   a reboot). With the `.deb` this needs no password; from a source checkout a
-   password dialog appears (`pkexec v4l2loopback-ctl add`).
-3. In your video-call program, select the camera **"&lt;your camera&gt; (Autofocus)"**.
-   v4l2loopback keeps only 31 characters of a name, so a long camera name is shortened;
-   the window shows the exact name.
+1. Start **Webcam Autofocus** from your application menu. A lens icon appears in the
+   panel (green = on, red = off, orange = problem), and the window opens.
+2. Choose your **camera** at the top of the window. Cameras without a manual focus
+   (many built-in laptop cameras are fixed-focus) are not offered; the window says which ones.
+3. Switch autofocus **on**: the switch at the top left of the window, or a left click on the
+   tray icon. Look into the camera for a moment; the first focusing takes a few seconds.
+4. In your video-call program, select the camera shown in the highlighted row of the
+   window, **"&lt;your camera&gt; (Autofocus)"**.
+5. Leave the window or close it (the tray icon keeps running). Switch autofocus off when you
+   do not need it.
 
-Only one program can read a camera at a time. That is why the video call uses the
-virtual camera and not your real one.
-
-Switching autofocus off hands the camera back to its own autofocus.
+**About the administrator password.** The virtual camera is a device of the system, so creating
+it needs administrator rights (and it is created again after every reboot). With the `.deb`
+installed, local users get this without a password through a polkit rule that allows exactly
+one small helper (`/usr/lib/webcam-autofocus/create-virtual-camera`). If your session is not
+allowed to (a remote session, for example), or when you run from a source checkout, the app first
+explains why it needs the rights and shows the equivalent terminal command, which you can copy
+instead of using the password dialog.
 
 ### Command line
 

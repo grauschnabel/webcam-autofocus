@@ -269,6 +269,14 @@ class MainWindow(Adw.ApplicationWindow):
         self._fill_cameras()
         cam_group = Adw.PreferencesGroup(margin_start=12, margin_end=12, margin_top=12)
         cam_group.add(self.cam_row)
+        self.virt_row = Adw.ActionRow(subtitle="Pick this camera in Zoom, Teams, your browser, OBS …",
+                                      css_classes=["accent"])
+        self.virt_row.add_prefix(Gtk.Image.new_from_icon_name("camera-video-symbolic"))
+        copy = Gtk.Button(icon_name="edit-copy-symbolic", valign=Gtk.Align.CENTER, tooltip_text="Copy the name",
+                          css_classes=["flat"])
+        copy.connect("clicked", lambda _b: Gdk.Display.get_default().get_clipboard().set(self.engine.virtual_name or ""))
+        self.virt_row.add_suffix(copy)
+        cam_group.add(self.virt_row)
         cam_group.add(self.cam_note)
 
         self.banner = Adw.Banner(title="", revealed=False)
@@ -365,7 +373,7 @@ class MainWindow(Adw.ApplicationWindow):
             self._cam_t = time.time()
             self._fill_cameras()
         if e.virtual_name:
-            self.cam_row.set_subtitle(f"Select in Zoom & co.: {e.virtual_name}")
+            self.virt_row.set_title(f"<b>{GLib.markup_escape_text(e.virtual_name)}</b>")
         if e.a.dynamic and int(self.every.get_value()) != e.a.eval_every:
             self.every.set_value(e.a.eval_every)             # slider follows the automatic adjustment
         if e.preview_on:
