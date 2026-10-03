@@ -338,7 +338,7 @@ class AutoFocus:
         while time.time() < end:                 # drain the buffer meanwhile
             self.grab()
 
-    def measure(self, box, n=4):
+    def measure(self, box, n=3):
         """Sharpness at the current focus. Movement of the head only ever blurs, so of n frames the best two
         count (their mean); the median would follow every dip."""
         vals = sorted(sharpness(self.grab(), box) for _ in range(n))

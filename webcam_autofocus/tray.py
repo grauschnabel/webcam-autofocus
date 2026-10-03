@@ -255,7 +255,8 @@ class MainWindow(Adw.ApplicationWindow):
 
         header = Adw.HeaderBar()
         self.switch = Gtk.Switch(valign=Gtk.Align.CENTER, tooltip_text="Autofocus on/off")
-        self.switch.connect("notify::active", self._on_switch)
+        self.switch.connect("state-set", self._on_switch)
+        self._switch_t = 0.0                                   # last click: the timer must not fight the switch meanwhile
         header.pack_start(self.switch)
         self.preview_btn = Gtk.ToggleButton(label="Preview", tooltip_text="Shows the image that arrives in Zoom")
         self.preview_btn.connect("toggled", self._on_preview)
@@ -349,9 +350,11 @@ class MainWindow(Adw.ApplicationWindow):
         if not self._syncing and 0 <= i < len(self.cams) and self.cams[i] != self.engine.cam:
             self.app.select_camera(self.cams[i])
 
-    def _on_switch(self, switch, _pspec):
+    def _on_switch(self, switch, state):
         if not self._syncing:
-            self.app.set_enabled(switch.get_active())
+            self._switch_t = time.time()
+            self.app.set_enabled(state)
+        return False                                           # let GTK move the switch itself
 
     def _on_preview(self, btn):
         self.revealer.set_reveal_child(btn.get_active())
@@ -360,9 +363,10 @@ class MainWindow(Adw.ApplicationWindow):
     def sync(self):
         """Called by the timer: sync switch, banner and texts with the engine state."""
         e = self.engine
-        self._syncing = True
-        self.switch.set_active(e.on)
-        self._syncing = False
+        if e.on != self.switch.get_active() and time.time() - self._switch_t > 2:
+            self._syncing = True
+            self.switch.set_active(e.on)
+            self._syncing = False
         self.banner.set_title(e.error or "")
         self.banner.set_revealed(bool(e.error))
         if not self.is_visible():
