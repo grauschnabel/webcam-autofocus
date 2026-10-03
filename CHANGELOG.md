@@ -6,6 +6,8 @@ the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-10-03
+
 ### Changed
 - A head that moved during a search no longer teaches the model a wrong distance: the result is not
   stored and a new search starts as soon as the new size has held for a moment.
