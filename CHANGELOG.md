@@ -6,6 +6,10 @@ the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- Every focus search writes one line (reason, start and end focus, all measured points, duration,
+  turns) to `~/.cache/webcam-autofocus/search.log`, to find out why a focus went wrong.
+
 ## [0.1.0] - 2026-10-03
 
 ### Changed

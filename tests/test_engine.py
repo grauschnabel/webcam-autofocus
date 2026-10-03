@@ -1,3 +1,4 @@
+import json
 import subprocess
 import sys
 import tempfile
@@ -176,6 +177,17 @@ class Search(unittest.TestCase):
             e.search(e.box, "face closer/farther")
             self.assertAlmostEqual(e.focus, 147, delta=3)
             self.assertLess(len(moves), 14)
+
+    def test_every_search_leaves_a_line_in_the_search_log(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(engine, "CALIB_DIR", Path(tmp)):
+            e = engine_with_fake_lens(tmp, best=100)
+            e.measure = lambda box, n=2: 1000.0 * np.exp(-((e.focus - 100) / 40.0) ** 2)
+            e.focus, e.ref, e.ref_w = 160, 500.0, 200
+            e.box = (500, 200, 200, 240)
+            e.search(e.box, "face closer/farther")
+            entry = json.loads((Path(tmp) / "search.log").read_text().splitlines()[-1])
+            self.assertEqual((entry["reason"], entry["outcome"], entry["start"]), ("face closer/farther", "done", 160))
+            self.assertGreater(len(entry["points"]), 2)
 
     def test_the_local_search_never_turns_back_while_measuring(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(engine, "CALIB_DIR", Path(tmp)):

@@ -380,6 +380,31 @@ class AutoFocus:
 
     # ---------- Focus search ----------
     def search(self, box, reason):
+        """Run a search and write one line about it to the search log (also when it is aborted)."""
+        trace, t0, old, outcome = [], time.time(), self.focus, "aborted"
+        try:
+            self._search(box, reason, trace)
+            outcome = "done"
+        finally:
+            self._log_search(dict(time=time.strftime("%Y-%m-%d %H:%M:%S"), camera=self.cam.name if self.cam else None,
+                                  reason=reason, outcome=outcome, seconds=round(time.time() - t0, 1),
+                                  width=box[2], start=old, end=self.focus, ref=self.ref and round(self.ref, 1),
+                                  turns=sum(1 for a, b, c in zip(trace, trace[1:], trace[2:])
+                                            if (b[0] - a[0]) * (c[0] - b[0]) < 0),
+                                  points=trace))
+
+    def _log_search(self, entry):
+        """One JSON line per search in ~/.cache/webcam-autofocus/search.log (cut to the last 500 lines);
+        for finding out why a focus went wrong. Never a reason to fail."""
+        path = CALIB_DIR / "search.log"
+        try:
+            CALIB_DIR.mkdir(parents=True, exist_ok=True)
+            lines = path.read_text().splitlines()[-499:] if path.exists() else []
+            path.write_text("\n".join(lines + [json.dumps(entry)]) + "\n")
+        except OSError:
+            pass
+
+    def _search(self, box, reason, trace):
         old = self.focus
         verify = reason == "check"
         self.verify_at = None
@@ -394,6 +419,7 @@ class AutoFocus:
             if v not in scores:
                 self.set_focus(v)
                 scores[v] = self.measure(box)
+                trace.append((v, round(scores[v], 1)))
             return scores[v]
 
         def finish(top, step):
