@@ -6,7 +6,11 @@ the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-03
+
 ### Changed
+- The first sweep stops only after a real peak (four times as sharp as the weakest point), not
+  after a bump in the blur, so a cold start no longer ends at a wrong focus.
 - The local search is one calm sweep upwards (no turning back while measuring) with a parabola
   through the best point, and the play of the lens is compensated in software: a move downwards
   is commanded lower, so every value means "arrived from below" and saved calibration stays valid.
@@ -62,8 +66,6 @@ the project uses [Semantic Versioning](https://semver.org/).
 - SIGTERM and SIGHUP (logout, `kill`, closing the terminal) hand the camera back to its own
   autofocus in the tray app and the terminal view.
 - The "show face frame" setting of the preview survives switching the camera.
-
-## [0.1.0] - 2026-10-02
 
 ### Added
 - Face-tracking contrast autofocus: sharpness is measured on the detected face, the
