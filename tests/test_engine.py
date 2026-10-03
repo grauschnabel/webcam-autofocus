@@ -152,6 +152,7 @@ class Search(unittest.TestCase):
     def test_a_wrong_first_direction_turns_around_and_the_lens_does_not_jump_about(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(engine, "CALIB_DIR", Path(tmp)):
             e = engine_with_fake_lens(tmp, best=150)
+            e.measure = lambda box, n=2: 1000.0 * np.exp(-((e.focus - 150) / 40.0) ** 2)
             e.focus, e.ref, e.ref_w = 100, 500.0, 400       # face got smaller -> first tries lower values
             e.box = (500, 200, 200, 240)
             visited = []
@@ -159,8 +160,8 @@ class Search(unittest.TestCase):
             e.set_focus = lambda v: (move(v), visited.append(e.focus))
             e.search(e.box, "face closer/farther")
             self.assertAlmostEqual(e.focus, 150, delta=5)
-            self.assertLess(len(visited), 20)               # a handful of steps, no sweep of the whole range
-            self.assertGreater(min(visited), 40)            # and it did not run off in the wrong direction
+            self.assertLess(len(visited), 17)               # a handful of steps, no sweep of the whole range
+            self.assertGreaterEqual(min(visited), 40)           # and it did not run off in the wrong direction
 
 
     def test_the_peak_between_two_steps_is_found_by_interpolation(self):
@@ -176,17 +177,33 @@ class Search(unittest.TestCase):
             self.assertAlmostEqual(e.focus, 147, delta=3)
             self.assertLess(len(moves), 14)
 
-    def test_the_final_approach_comes_from_below(self):
+    def test_the_local_search_never_turns_back_while_measuring(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(engine, "CALIB_DIR", Path(tmp)):
             e = engine_with_fake_lens(tmp, best=100)
             e.measure = lambda box, n=2: 1000.0 * np.exp(-((e.focus - 100) / 40.0) ** 2)
-            e.focus, e.ref, e.ref_w = 160, 500.0, 200         # coming from above
+            e.focus, e.ref, e.ref_w = 160, 500.0, 200
             e.box = (500, 200, 200, 240)
             moves = []
             move = e.set_focus
             e.set_focus = lambda v: (move(v), moves.append(e.focus))
             e.search(e.box, "face closer/farther")
-            self.assertLessEqual(moves[-2], moves[-1])             # the last move is upwards
+            turns = sum(1 for a, b, c in zip(moves, moves[1:], moves[2:]) if (b - a) * (c - b) < 0)
+            self.assertLessEqual(turns, 3)                   # down for the retry, up, back to the peak
+            self.assertAlmostEqual(e.focus, 100, delta=5)
+
+    def test_a_downward_move_is_commanded_lower_to_make_up_for_the_play(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            e = make_engine(tmp, CAM)
+            e.w, e.h = 1280, 720
+            e.grab = lambda: None
+            e.a.settle, e.dev = 0, "/dev/video0"
+            sent = []
+            with mock.patch.object(engine, "v4l2", lambda dev, **kw: sent.append(kw["focus_absolute"])):
+                e.set_focus(100)
+                e.set_focus(150)
+                e.set_focus(120)
+            self.assertEqual(sent, [100, 150, 120 - e.a.backlash])
+            self.assertEqual(e.focus, 120)                   # the value stays "as if arrived from below"
 
 class Run(unittest.TestCase):
     def test_waiting_for_a_face_starts_with_the_run(self):

@@ -7,6 +7,11 @@ the project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Changed
+- The local search is one calm sweep upwards (no turning back while measuring) with a parabola
+  through the best point, and the play of the lens is compensated in software: a move downwards
+  is commanded lower, so every value means "arrived from below" and saved calibration stays valid.
+  The reference sharpness is the median of five frames, like the running value, so a freshly found
+  focus is no longer "re-checked" without reason.
 - The focus search is systematic: a step that makes the picture sharper is followed by the next
   one in the same direction, a step that does not turns around, and the step size is halved once
   both sides have been tried. The regular check no longer moves the lens while the picture is
