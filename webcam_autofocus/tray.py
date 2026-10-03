@@ -464,10 +464,12 @@ class App(Adw.Application):
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
         self.autostart, self._first_activate, self.hidden = autostart, True, hidden
         self.engine = AutoFocus(cfg)
+        self.engine.confirm_create = True                      # explain the password before asking for it
         self.window = None
         self.tray = None
         self._last_error = None
         self._tick_error = None
+        self._asking = False
 
     def do_startup(self):
         Adw.Application.do_startup(self)
@@ -522,8 +524,54 @@ class App(Adw.Application):
                 sys.stderr.write(msg)
         return True
 
+    def ask_create_virtual(self):
+        """Explain why administrator rights are needed; offer to create the camera or to copy the command."""
+        cam = self.engine.cam
+        if not cam or self._asking:
+            return
+        self._asking = True
+        cmd = cameras.manual_command(cam)
+        dlg = Adw.MessageDialog(transient_for=self.window if self.window and self.window.is_visible() else None,
+                                heading="Create the virtual camera?")
+        dlg.set_body(
+            f"Video-call programs (Zoom, Teams, browsers) get the sharp picture from a virtual camera named "
+            f"\"{cam.virtual_name}\". Creating a camera device is a change to the system, so it needs "
+            f"administrator rights; the password dialog that follows is for exactly that and nothing else.\n\n"
+            f"If you prefer, run this in a terminal and switch autofocus on again:\n{cmd}")
+        dlg.set_body_use_markup(False)
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("copy", "Copy command")
+        dlg.add_response("create", "Create…")
+        dlg.set_response_appearance("create", Adw.ResponseAppearance.SUGGESTED)
+        dlg.set_default_response("create")
+        dlg.set_close_response("cancel")
+
+        def answered(_dlg, response):
+            self._asking = False
+            if response == "create":
+                self._create_virtual(cam)
+            elif response == "copy":
+                Gdk.Display.get_default().get_clipboard().set(cmd)
+        dlg.connect("response", answered)
+        dlg.present()
+
+    def _create_virtual(self, cam):
+        def work():
+            try:
+                cameras.ensure_virtual(cam)
+            except RuntimeError as err:
+                self.engine.error = str(err)
+                return
+            GLib.idle_add(self.engine.start)
+        self.engine.error = None
+        threading.Thread(target=work, daemon=True).start()
+
     def _refresh(self):
         e = self.engine
+        if e.need_virtual:
+            e.need_virtual = False
+            e.error = self._last_error = "The virtual camera does not exist yet"   # the dialog says it, no notification
+            self.ask_create_virtual()
         if e.error:
             icon, tip = ICON_ERR, e.error
         elif e.active:

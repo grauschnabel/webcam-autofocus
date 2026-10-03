@@ -148,6 +148,20 @@ class Search(unittest.TestCase):
             self.assertEqual(e.mode, "tracking face")
 
 
+    def test_a_wrong_first_direction_turns_around_and_the_lens_does_not_jump_about(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(engine, "CALIB_DIR", Path(tmp)):
+            e = engine_with_fake_lens(tmp, best=150)
+            e.focus, e.ref, e.ref_w = 100, 500.0, 400       # face got smaller -> first tries lower values
+            e.box = (500, 200, 200, 240)
+            visited = []
+            move = e.set_focus
+            e.set_focus = lambda v: (move(v), visited.append(e.focus))
+            e.search(e.box, "face closer/farther")
+            self.assertAlmostEqual(e.focus, 150, delta=5)
+            self.assertLess(len(visited), 20)               # a handful of steps, no sweep of the whole range
+            self.assertGreater(min(visited), 40)            # and it did not run off in the wrong direction
+
+
 class Run(unittest.TestCase):
     def test_waiting_for_a_face_starts_with_the_run(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -192,6 +206,32 @@ class Run(unittest.TestCase):
                 with self.assertRaisesRegex(engine.EngineError, "ffmpeg"):
                     e._open()
             cap.release.assert_called_once()
+
+
+class MissingVirtualCamera(unittest.TestCase):
+    def test_a_ui_that_asks_first_gets_told_instead_of_a_password_dialog(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            e = make_engine(tmp, CAM)
+            e.confirm_create = True
+            with mock.patch.object(cameras, "find_virtual", return_value=None), \
+                    mock.patch.object(cameras, "needs_password", return_value=True), \
+                    mock.patch.object(cameras, "ensure_virtual") as create:
+                with self.assertRaises(engine.EngineError):
+                    e._virtual()
+            self.assertTrue(e.need_virtual)
+            create.assert_not_called()
+
+    def test_without_a_password_or_without_a_ui_it_is_created_right_away(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            for confirm, password in ((True, False), (False, True)):
+                e = make_engine(tmp, CAM)
+                e.confirm_create = confirm
+                with mock.patch.object(cameras, "find_virtual", return_value=None), \
+                        mock.patch.object(cameras, "needs_password", return_value=password), \
+                        mock.patch.object(cameras, "ensure_virtual", return_value="/dev/video9") as create:
+                    self.assertEqual(e._virtual(), "/dev/video9")
+                create.assert_called_once()
+                self.assertFalse(e.need_virtual)
 
 
 class V4l2(unittest.TestCase):

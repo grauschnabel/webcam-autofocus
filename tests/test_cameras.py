@@ -98,6 +98,37 @@ class VirtualCamera(unittest.TestCase):
                 self.assertEqual([dev for dev, _ in cameras._sources()], ["/dev/video0", "/dev/video2"])
 
 
+class Password(unittest.TestCase):
+    cam = cameras.Camera("Test Cam", "/dev/video0", 1, 100)
+
+    def test_command_for_the_terminal_uses_the_helper_when_installed(self):
+        with tempfile.TemporaryDirectory() as d:
+            helper = Path(d) / "helper"
+            helper.touch()
+            with mock.patch.object(cameras, "HELPER", str(helper)):
+                self.assertEqual(cameras.manual_command(self.cam), f"sudo {helper} 'Test Cam (Autofocus)'")
+
+    def test_command_for_a_source_checkout_loads_the_module_too(self):
+        with mock.patch.object(cameras, "HELPER", "/nonexistent/helper"):
+            cmd = cameras.manual_command(self.cam)
+        self.assertTrue(cmd.startswith("sudo modprobe v4l2loopback devices=0 exclusive_caps=1 && sudo v4l2loopback-ctl add"))
+
+    def test_a_source_checkout_always_asks(self):
+        with mock.patch.object(cameras, "HELPER", "/nonexistent/helper"):
+            self.assertTrue(cameras.needs_password())
+
+    def test_polkit_decides_when_the_helper_is_installed(self):
+        with tempfile.TemporaryDirectory() as d:
+            helper = Path(d) / "helper"
+            helper.touch()
+            with mock.patch.object(cameras, "HELPER", str(helper)):
+                for code, expected in ((0, False), (1, True), (2, True)):
+                    with mock.patch.object(cameras.subprocess, "run", return_value=SimpleNamespace(returncode=code)):
+                        self.assertEqual(cameras.needs_password(), expected)
+                with mock.patch.object(cameras.subprocess, "run", side_effect=FileNotFoundError):
+                    self.assertTrue(cameras.needs_password())
+
+
 class FocusProbe(unittest.TestCase):
     OUT = "focus_absolute 0x009a090a (int)    : min=1 max=500 step=1 default=1 value=181\n"
 

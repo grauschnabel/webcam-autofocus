@@ -6,6 +6,15 @@ the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- The focus search is systematic: a step that makes the picture sharper is followed by the next
+  one in the same direction, a step that does not turns around, and the step size is halved once
+  both sides have been tried. The regular check no longer moves the lens while the picture is
+  still sharp.
+- Before a password dialog for creating the virtual camera, the tray app explains why
+  administrator rights are needed and offers the equivalent terminal command to copy. If polkit
+  already allows it, the camera is created without asking.
+
 ### Fixed
 - Names of virtual cameras are cut to the 31 characters v4l2loopback keeps. A longer camera
   name (for example "C922 Pro Stream Webcam") was never found again, so autofocus could not

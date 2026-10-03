@@ -94,6 +94,8 @@ class AutoFocus:
         self.a = cfg or Config()
         self.on_frame = None               # hook, called per camera frame (the display throttles itself)
         self.error = None
+        self.confirm_create = False        # a UI sets this to be asked before a password dialog (see _virtual)
+        self.need_virtual = False          # set when the virtual camera is missing and the UI should ask
         self._thread = None
         self._stop = threading.Event()
         self._base = (self.a.fmin, self.a.fmax, self.a.coarse, self.a.climb)   # defaults that each camera is fitted to
@@ -242,7 +244,7 @@ class AutoFocus:
             self.out = None
             if not a.no_output:
                 try:
-                    out = a.out or cameras.ensure_virtual(self.cam)
+                    out = a.out or self._virtual()
                 except RuntimeError as err:
                     raise EngineError(str(err))
                 if not os.path.exists(out):
@@ -258,6 +260,18 @@ class AutoFocus:
         except BaseException:
             self.cap.release()                               # a failed start must not keep the camera busy
             raise
+
+    def _virtual(self):
+        """The virtual camera. If it is missing and creating it would ask for a password, a UI that
+        sets confirm_create gets to explain that first (need_virtual) instead of a bare password dialog."""
+        dev = cameras.find_virtual(self.cam)
+        if dev:
+            return dev
+        if self.confirm_create and cameras.needs_password():
+            self.need_virtual = True
+            raise EngineError("The virtual camera does not exist yet")
+        self.log.append(f"{time.strftime('%H:%M:%S')}  Creating the virtual camera \"{self.cam.virtual_name}\"")
+        return cameras.ensure_virtual(self.cam)
 
     def _close(self):
         try:
@@ -372,19 +386,21 @@ class AutoFocus:
             return center
 
         def climb(start, step, first_dir=1):
-            """Hill climbing: from the start value in the better direction, as long as it improves."""
-            best = start
+            """Step, compare, decide: a step that makes the picture sharper is followed by the next one in
+            the same direction; one that does not turns around. Once both sides of the best value have been
+            tried at a step size, the step is halved. Ends when the step is too small to matter."""
+            best, direction, turns = start, first_dir, 0
             score(best)
-            while step >= 5:
-                for direction in (first_dir, -first_dir):
-                    cand = best + direction * step
-                    if self.a.fmin <= cand <= self.a.fmax and score(cand) > scores[best] * 1.02:
-                        best = cand
-                        while self.a.fmin <= best + direction * step <= self.a.fmax and \
-                                score(best + direction * step) > scores[best] * 1.02:
-                            best += direction * step
-                        break
-                step //= 2
+            for _ in range(40):                              # upper limit, the loop normally ends on its own
+                if step < 5:
+                    break
+                cand = best + direction * step
+                if self.a.fmin <= cand <= self.a.fmax and score(cand) > scores[best] * 1.03:
+                    best = cand                              # sharper: keep going this way
+                    continue
+                direction, turns = -direction, turns + 1     # not sharper (or the end of the range): turn around
+                if turns % 2 == 0:
+                    step //= 2                               # tried both sides at this step size: finer
             return best
 
         def peak(v):
@@ -500,7 +516,10 @@ class AutoFocus:
                         reason = "check"
                 if (reason is None and self.recheck_at and now >= self.recheck_at and now >= self.cooldown
                         and self.ref_w and abs(box[2] / self.ref_w - 1) <= self.a.size_tol_pred):
-                    reason = "check"                          # check and improve regularly
+                    if self.ema < .9 * self.ref:              # only touch the lens if the picture really got softer
+                        reason = "check"
+                    else:
+                        self.recheck_at = now + self.a.recheck
                 if reason:
                     self.search(box, reason)
         except Stopped:
@@ -514,6 +533,7 @@ class AutoFocus:
         if self.active:
             return
         self.error = None
+        self.need_virtual = False
         self._thread = threading.Thread(target=self._thread_main, daemon=True)
         self._thread.start()
 
