@@ -6,6 +6,13 @@ the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- The sharpness value is measured on the face core scaled to a fixed size (less sensor noise, no
+  dependence on the face size) and divided by the brightness squared. Saved calibrations of
+  earlier versions are not used any more (their sharpness values have another scale).
+- A move downwards no longer relies on a fixed play: the lens goes 60 units below the target
+  first and then up to it, so every target is reached from below, however long the way back was.
+
 ## [0.1.1] - 2026-10-03
 
 ### Changed

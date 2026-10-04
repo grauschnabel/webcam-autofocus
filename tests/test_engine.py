@@ -228,7 +228,7 @@ class Search(unittest.TestCase):
             self.assertLessEqual(turns, 3)                   # down for the retry, up, back to the peak
             self.assertAlmostEqual(e.focus, 100, delta=5)
 
-    def test_a_downward_move_is_commanded_lower_to_make_up_for_the_play(self):
+    def test_a_downward_move_goes_below_the_target_first_and_arrives_from_below(self):
         with tempfile.TemporaryDirectory() as tmp:
             e = make_engine(tmp, CAM)
             e.w, e.h = 1280, 720
@@ -239,8 +239,8 @@ class Search(unittest.TestCase):
                 e.set_focus(100)
                 e.set_focus(150)
                 e.set_focus(120)
-            self.assertEqual(sent, [100, 150, 120 - e.a.backlash])
-            self.assertEqual(e.focus, 120)                   # the value stays "as if arrived from below"
+            self.assertEqual(sent, [100, 150, 120 - e.a.backlash, 120])
+            self.assertEqual(e.focus, 120)
 
 class Run(unittest.TestCase):
     def test_waiting_for_a_face_starts_with_the_run(self):

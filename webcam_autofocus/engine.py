@@ -19,8 +19,9 @@ from . import cameras
 
 AUTO = "focus_automatic_continuous"
 SWEEP_STEP = 15                                          # step of the local search
+SHARP_SIZE = 160                                         # the face core is measured at this many pixels square
 FINE_STEP = 10                                           # the parabola takes over below this step size
-CALIB_DIR = Path.home() / ".cache" / "webcam-autofocus"   # one calibration file per camera (v2: points with sharpness value)
+CALIB_DIR = Path.home() / ".cache" / "webcam-autofocus"   # one calibration file per camera (v3: points with sharpness value)
 
 
 @dataclass
@@ -34,7 +35,7 @@ class Config:
     fmax: int = 300
     coarse: int = 20                   # step size of the coarse search
     climb: int = 40                    # initial step size when refocusing
-    backlash: int = 33                 # play of the lens: commands that go downwards are this much lower
+    backlash: int = 60                 # a move downwards goes this far below the target first, then up to it
     settle: float = 0.2                # seconds to wait after a focus change
     size_tol: float = 0.15             # face width ± beyond which to refocus
     size_tol_pred: float = 0.08        # same, once a prediction is available
@@ -83,14 +84,17 @@ def load_cascade():
 
 
 def sharpness(frame, box):
-    """Variance of the Laplacian in the core of the face box (eyes/nose/mouth)."""
+    """Variance of the Laplacian in the core of the face box (eyes/nose/mouth). The core is scaled to a fixed
+    size (area averaging also takes the sensor noise away, and the value no longer depends on how big the
+    face is) and divided by the brightness squared (a lamp turned on is not a sharper picture)."""
     x, y, w, h = box
     x, y, w, h = x + int(w * .2), y + int(h * .2), int(w * .6), int(h * .6)
     roi = frame[max(y, 0):y + h, max(x, 0):x + w]
     if roi.size == 0:
         return 0.0
-    gray = cv2.GaussianBlur(cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY), (3, 3), 0)
-    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    gray = cv2.GaussianBlur(cv2.resize(gray, (SHARP_SIZE, SHARP_SIZE), interpolation=cv2.INTER_AREA), (3, 3), 0)
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var() / (float(gray.mean()) + 10) ** 2 * 1e4)
 
 
 class AutoFocus:
@@ -136,7 +140,7 @@ class AutoFocus:
 
     def _calib_file(self):
         slug = "".join(c if c.isalnum() else "-" for c in (self.cam.name if self.cam else "unknown")).lower()
-        return CALIB_DIR / f"{slug}-v2.json"
+        return CALIB_DIR / f"{slug}-v3.json"
 
     def _reset_state(self):
         self._pick_camera()
@@ -334,12 +338,14 @@ class AutoFocus:
         10 (more than a second for a long jump), and it starts a moment late, so a picture that merely looks
         steady is no proof. Whatever is read earlier is the blur of the lens on its way."""
         value = self._clamp(value)
-        cmd = value
-        if self._cmd is not None and value < self._cmd:      # the lens has play: from above the same command is a different
-            cmd = max(self.a.fmin, value - self.a.backlash)  # focus, so values are always meant as "arrived from below"
+        if self._cmd is not None and value < self._cmd:      # the lens has play, and how much depends on the way back:
+            self._move(max(self.a.fmin, value - self.a.backlash))   # go well below, so the target is always reached from below
+        self._move(value)
+
+    def _move(self, cmd):
         jump = abs(cmd - self._cmd) if self._cmd is not None else self.a.fmax - self.a.fmin   # unknown after the camera's own autofocus
         v4l2(self.dev, focus_absolute=cmd)
-        self.focus, self.lens_known, self._cmd = value, True, cmd
+        self.focus, self.lens_known, self._cmd = cmd, True, cmd
         end = time.time() + min(3.0, self.a.settle + .012 * jump)
         while time.time() < end:                 # drain the buffer meanwhile
             self.grab()
