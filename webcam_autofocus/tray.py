@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 import traceback
+from collections import deque
 from pathlib import Path
 
 import gi
@@ -31,6 +32,7 @@ ICON_ON, ICON_OFF, ICON_ERR = "on", "off", "error"       # state of the panel ic
 LENS = {ICON_ON: (0.20, 0.78, 0.35), ICON_OFF: (0.90, 0.22, 0.22), ICON_ERR: (0.95, 0.60, 0.10)}
 GRAPH_SECONDS = 30
 GREEN, ORANGE, RED = (0.20, 0.70, 0.35), (0.95, 0.60, 0.10), (0.85, 0.25, 0.25)
+CPU_COLOR = (0.55, 0.40, 0.90)                           # purple: not one of the state colours
 
 SNI_XML = """
 <node>
@@ -294,10 +296,29 @@ class MainWindow(Adw.ApplicationWindow):
         pv_box.append(self.overlay_chk)
         self.revealer = Gtk.Revealer(child=pv_box, reveal_child=False)
         self._pv_t = 0.0
-        self.slider = Gtk.DrawingArea(content_height=110, margin_start=12, margin_end=12, margin_top=12)
+        self.manual = Gtk.CheckButton(label="Manual focus", active=engine.a.manual, halign=Gtk.Align.START,
+                                      margin_start=14, margin_top=12)
+        self.manual.set_tooltip_text("Move the focus slider yourself (drag or scroll). Green = sharp, orange = not sharp; "
+                                     "it can tell once you moved the slider a bit.")
+        self.manual.connect("toggled", self._on_manual)
+        self.slider = Gtk.DrawingArea(content_height=110, margin_start=12, margin_end=12)
         self.slider.set_draw_func(self._draw_slider)
+        self.slider.set_cursor_from_name("pointer" if engine.a.manual else None)
+        self._wheel = 0.0                                      # scroll amount not yet turned into a focus step
+        drag = Gtk.GestureDrag()
+        drag.connect("drag-begin", lambda g, x, y: self._slide_to(x))
+        drag.connect("drag-update", lambda g, dx, dy: self._slide_to(g.get_start_point()[1] + dx))
+        self.slider.add_controller(drag)
+        scroll = Gtk.EventControllerScroll(flags=Gtk.EventControllerScrollFlags.VERTICAL)
+        scroll.connect("scroll", self._on_scroll)
+        self.slider.add_controller(scroll)
         self.graph = Gtk.DrawingArea(content_height=140, margin_start=12, margin_end=12, margin_top=6)
         self.graph.set_draw_func(self._draw_graph)
+        self.cpu_chk = Gtk.CheckButton(label="CPU", halign=Gtk.Align.START, margin_start=14)
+        self.cpu_chk.set_tooltip_text("Also show how much CPU this program uses (percent of one core).")
+        self.cpu_chk.connect("toggled", lambda c: (self.cpu_hist.clear(), self.graph.queue_draw()))
+        self.cpu_hist = deque()                                # (time, percent), only while the box is ticked
+        self._cpu_ref = (time.monotonic(), time.process_time())
         self.status = Gtk.Label(xalign=0, margin_start=16, margin_end=16, margin_top=6)
         self.log = Gtk.Label(xalign=0, yalign=0, vexpand=True, margin_start=16, margin_end=16, margin_top=6,
                              margin_bottom=12, css_classes=["dim-label", "monospace"])
@@ -321,13 +342,63 @@ class MainWindow(Adw.ApplicationWindow):
         head.append(self.dyn)
         ev_box.append(head)
         ev_box.append(self.every)
-        for w in (self.banner, cam_group, self.revealer, ev_box, self.slider, self.graph, self.status, self.log):
+        self.blur = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 15, 60, 5)
+        self.blur.set_value(round(min(max(engine.a.blur, .15), .6) * 100))
+        self.blur.set_digits(0)
+        self.blur.set_draw_value(True)
+        self.blur.set_value_pos(Gtk.PositionType.RIGHT)
+        self.blur.set_format_value_func(lambda _s, v: f"{v:.0f} %")
+        for m in (15, 35, 60):
+            self.blur.add_mark(m, Gtk.PositionType.BOTTOM, f"{m} %")
+        self.blur.set_tooltip_text("Refocus only when the sharpness has dropped by more than this share (for 1.5 s). "
+                                   "Higher = calmer, fewer searches; lower = sharper picture. Not below 15 %: "
+                                   "the measurement itself fluctuates by about that much.")
+        self.blur.connect("value-changed", lambda s: setattr(engine.a, "blur", round(s.get_value()) / 100))   # read live by the engine
+        ev_box.append(Gtk.Label(label="Allowed blur before refocusing", halign=Gtk.Align.START, margin_top=8))
+        ev_box.append(self.blur)
+        self.freeze_chk = Gtk.CheckButton(label="Still picture during search", active=engine.a.freeze,
+                                          halign=Gtk.Align.START, margin_top=6)
+        self.freeze_chk.set_tooltip_text("While the lens searches, the video call sees a still picture instead of the lens sweeping through blur.")
+        self.freeze_chk.connect("toggled", lambda c: setattr(engine.a, "freeze", c.get_active()))
+        ev_box.append(self.freeze_chk)
+        for w in (self.banner, cam_group, self.revealer, ev_box, self.manual, self.slider, self.graph, self.cpu_chk, self.status, self.log):
             box.append(w)
         view = Adw.ToolbarView()
         view.add_top_bar(header)
         view.set_content(box)
         self.set_content(view)
         self.set_hide_on_close(True)                                                # closing only hides the window
+
+    SLIDER_PAD = 28
+
+    def _on_manual(self, chk):
+        e = self.engine
+        if chk.get_active():
+            e.manual_target = e.focus                          # start where the lens is
+        e.a.manual = chk.get_active()
+        self.slider.set_cursor_from_name("pointer" if chk.get_active() else None)
+
+    def _set_manual_focus(self, value):
+        e = self.engine
+        e.manual_target = int(min(max(round(value), e.a.fmin), e.a.fmax))
+        self._disp = float(e.manual_target)                   # the knob follows the mouse, no gliding
+        self.slider.queue_draw()
+
+    def _slide_to(self, x):
+        if not self.engine.a.manual:
+            return
+        lo, hi, pad = self.engine.a.fmin, self.engine.a.fmax, self.SLIDER_PAD
+        self._set_manual_focus(lo + (x - pad) / max(1, self.slider.get_width() - 2 * pad) * (hi - lo))
+
+    def _on_scroll(self, _ctl, _dx, dy):
+        e = self.engine
+        if not e.a.manual:
+            return False
+        self._wheel += dy                                     # touchpads send fractions of a notch: add them up
+        step, self._wheel = int(self._wheel), self._wheel - int(self._wheel)
+        if step:
+            self._set_manual_focus((e.manual_target if e.manual_target is not None else e.focus) - step)   # one unit per notch
+        return True
 
     def _fill_cameras(self):
         """Fill the dropdown with the cameras; the one chosen in the engine stays selected."""
@@ -363,6 +434,7 @@ class MainWindow(Adw.ApplicationWindow):
     def sync(self):
         """Called by the timer: sync switch, banner and texts with the engine state."""
         e = self.engine
+        self._sample_cpu()
         if e.on != self.switch.get_active() and time.time() - self._switch_t > 2:
             self._syncing = True
             self.switch.set_active(e.on)
@@ -390,7 +462,8 @@ class MainWindow(Adw.ApplicationWindow):
                 self.picture.set_paintable(Gdk.MemoryTexture.new(
                     w, h, Gdk.MemoryFormat.B8G8R8, GLib.Bytes.new(data), w * 3))
             self.pv_stack.set_visible_child_name("pic" if e.active and e.preview else "hint")
-        self._disp += (e.focus - self._disp) * 0.35
+        goal = e.manual_target if e.a.manual and e.manual_target is not None else e.focus
+        self._disp += (goal - self._disp) * 0.35
         face = f"{e.box[2]} px" if e.box else "—"
         sharp = f"{e.ema:.0f}" if e.ema is not None else "—"
         self.status.set_text(f"{e.mode}  ·  Sharpness {sharp}  ·  Face {face}")
@@ -398,20 +471,36 @@ class MainWindow(Adw.ApplicationWindow):
         self.slider.queue_draw()
         self.graph.queue_draw()
 
+    def _sample_cpu(self):
+        """CPU of the whole process (all threads, so the engine too), averaged over ~1 s."""
+        t, c = time.monotonic(), time.process_time()
+        t0, c0 = self._cpu_ref
+        if t - t0 < 1.0:
+            return
+        self._cpu_ref = (t, c)
+        if not self.cpu_chk.get_active() or t - t0 > 3:       # off, or a stale window (timer stalled)
+            return
+        now = time.time()
+        self.cpu_hist.append((now, 100 * (c - c0) / (t - t0)))
+        while self.cpu_hist and now - self.cpu_hist[0][0] > GRAPH_SECONDS:
+            self.cpu_hist.popleft()
+
     def _accent(self):
         e = self.engine
         if e.error:
             return RED
+        if e.a.manual:                                         # sharp / not sharp / cannot tell yet
+            return {True: GREEN, False: ORANGE}.get(e.sharp)
         return ORANGE if e.mode == "searching focus" else GREEN
 
     def _draw_slider(self, area, cr, w, h):
         e = self.engine
         fg = area.get_color()
-        pad, y = 28, 46
+        pad, y = self.SLIDER_PAD, 46
         lo, hi = e.a.fmin, e.a.fmax
         frac = min(max((self._disp - lo) / (hi - lo), 0.0), 1.0)
         x = pad + frac * (w - 2 * pad)
-        r, g, b = self._accent() if e.active else (fg.red, fg.green, fg.blue)
+        r, g, b = (self._accent() if e.active else None) or (fg.red, fg.green, fg.blue)
         cr.set_line_cap(1)                                    # round
         cr.set_line_width(7)
         cr.set_source_rgba(fg.red, fg.green, fg.blue, .22)
@@ -425,7 +514,7 @@ class MainWindow(Adw.ApplicationWindow):
         cr.set_source_rgba(fg.red, fg.green, fg.blue, .6)
         cr.move_to(pad - 4, y - 20), cr.show_text(str(lo))
         cr.move_to(w - pad - 18, y - 20), cr.show_text(str(hi))
-        text = str(e.focus)
+        text = str(round(self._disp) if e.a.manual else e.focus)
         cr.set_font_size(22)
         tw = cr.text_extents(text).x_advance
         changed = time.time() - e.changed_t < 3
@@ -450,17 +539,24 @@ class MainWindow(Adw.ApplicationWindow):
         cr.set_source_rgba(fg.red, fg.green, fg.blue, .08)
         cr.rectangle(0, top, w, bottom - top), cr.fill()
         cr.set_font_size(11)
-        r, g, b = self._accent()
+        r, g, b = self._accent() or (fg.red, fg.green, fg.blue)
         cr.set_source_rgba(r, g, b, 1)
         cr.rectangle(4, 6, 8, 8), cr.fill()                  # legend swatch (no glyph: not every font has "■")
         cr.move_to(16, 14), cr.show_text("Sharpness")
         cr.set_source_rgba(fg.red, fg.green, fg.blue, .8)
         cr.rectangle(90, 9, 12, 2), cr.fill()
         cr.move_to(106, 14), cr.show_text("Focus")
+        cr.set_source_rgba(fg.red, fg.green, fg.blue, .6)
+        cr.set_line_width(1.2), cr.set_dash([4, 2])
+        cr.move_to(150, 10), cr.line_to(166, 10), cr.stroke()    # dashed swatch
+        cr.set_dash([])
+        cr.move_to(170, 14), cr.show_text("Refocus below")
+        if self.cpu_chk.get_active():
+            self._draw_cpu(cr, w, now, top, bottom)
         if len(hist) < 2:
             return
         xs = [w * (1 - (now - p[0]) / GRAPH_SECONDS) for p in hist]
-        smax = max(p[2] for p in hist) or 1.0
+        smax = max(max(p[2] for p in hist), max((p[3] for p in hist if p[3]), default=0)) or 1.0
         span = e.a.fmax - e.a.fmin
         sharp = [bottom - (p[2] / smax) * (bottom - top - 4) for p in hist]
         focus = [bottom - ((p[1] - e.a.fmin) / span) * (bottom - top - 4) for p in hist]
@@ -473,9 +569,37 @@ class MainWindow(Adw.ApplicationWindow):
         for i, (x, y) in enumerate(zip(xs, sharp)):
             (cr.move_to if i == 0 else cr.line_to)(x, y)
         cr.stroke()
+        cr.set_source_rgba(fg.red, fg.green, fg.blue, .6), cr.set_line_width(1.2), cr.set_dash([5, 3])   # threshold: step line
+        prev = None
+        for i, p in enumerate(hist):
+            if p[3] is None:
+                prev = None
+                continue
+            y = bottom - (p[3] / smax) * (bottom - top - 4)
+            if prev is None:
+                cr.move_to(xs[i], y)
+            else:
+                cr.line_to(xs[i], prev), cr.line_to(xs[i], y)
+            prev = y
+        cr.stroke()
+        cr.set_dash([])
         cr.set_source_rgba(fg.red, fg.green, fg.blue, .8), cr.set_line_width(1.5)
         for i, (x, y) in enumerate(zip(xs, focus)):
             (cr.move_to if i == 0 else cr.line_to)(x, y)
+        cr.stroke()
+
+    def _draw_cpu(self, cr, w, now, top, bottom):
+        pts = list(self.cpu_hist)
+        cr.set_source_rgba(*CPU_COLOR, 1)
+        cr.rectangle(262, 9, 12, 2), cr.fill()                 # legend: own swatch + current value
+        cr.move_to(278, 14), cr.show_text(f"CPU {pts[-1][1]:.0f} %" if pts else "CPU …")
+        if len(pts) < 2:
+            return
+        cmax = max(100.0, max(p[1] for p in pts))              # own scale: 0–100 %, more if several cores busy
+        cr.set_line_width(1.5)
+        for i, (t, v) in enumerate(pts):
+            (cr.move_to if i == 0 else cr.line_to)(w * (1 - (now - t) / GRAPH_SECONDS),
+                                                   bottom - v / cmax * (bottom - top - 4))
         cr.stroke()
 
 

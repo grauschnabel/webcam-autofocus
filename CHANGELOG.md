@@ -6,7 +6,27 @@ the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- Checkbox "CPU" under the graph: also shows how much CPU the program uses (percent of one core).
+- Checkbox "Manual focus" above the slider: you move the focus yourself (drag the slider or use
+  the mouse wheel) and the engine does not search; the slider and the face frame turn green when the
+  picture is sharp and orange when it is not (once you moved the slider over some range). Unticking
+  it hands the lens back to the autofocus, which focuses anew.
+- Slider "Allowed blur before refocusing" (15–60 %, default 35 %; also `--blur 0.35`): the autofocus
+  refocuses only when the sharpness has dropped by more than this share below the value measured
+  right after the last focusing, for 1.5 s. Not below 15 %, because the measurement itself fluctuates.
+- Checkbox "Still picture during search": the video call sees a still picture while the lens searches.
+- The graph shows a dashed line "Refocus below": the sharpness level that triggers a refocus.
+
 ### Changed
+- The allowed blur is the only trigger for a new search. The checks after a prediction and the
+  regular check every minute are gone (they swept the lens through blur although the picture was
+  sharp), and a changed face size alone no longer refocuses: the sharpness value is already
+  independent of the face size. Options `--recheck`, `--verify-delay`, `--sharp-drop` and
+  `--size-tol-pred` are removed.
+- A search moves the lens only if the peak it found is at least 15 % sharper than the old position
+  (which is measured too); otherwise the lens goes back there. The very first focus always takes the
+  peak. The search log has a new field `kept`.
 - The sharpness value is measured on the face core scaled to a fixed size (less sensor noise, no
   dependence on the face size) and divided by the brightness squared. Saved calibrations of
   earlier versions are not used any more (their sharpness values have another scale).

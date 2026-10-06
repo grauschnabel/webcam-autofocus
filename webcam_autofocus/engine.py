@@ -20,7 +20,9 @@ from . import cameras
 AUTO = "focus_automatic_continuous"
 SWEEP_STEP = 15                                          # step of the local search
 SHARP_SIZE = 160                                         # the face core is measured at this many pixels square
-FINE_STEP = 10                                           # the parabola takes over below this step size
+MANUAL_SPAN = 20                                         # manual focus: judge only after the slider covered this many units
+MIN_GAIN = 1.15                                          # a search moves the lens only if the peak is this much sharper than the old position
+MANUAL_GOOD = 0.8                                        # manual focus: green from this fraction of the sharpest picture seen
 CALIB_DIR = Path.home() / ".cache" / "webcam-autofocus"   # one calibration file per camera (v3: points with sharpness value)
 
 
@@ -37,18 +39,16 @@ class Config:
     climb: int = 40                    # initial step size when refocusing
     backlash: int = 60                 # a move downwards goes this far below the target first, then up to it
     settle: float = 0.2                # seconds to wait after a focus change
-    size_tol: float = 0.15             # face width ± beyond which to refocus
-    size_tol_pred: float = 0.08        # same, once a prediction is available
+    size_tol: float = 0.15             # face width change that counts as moved (during a search) or as another distance (manual judge)
     dynamic: bool = False              # adapt eval_every to the CPU load automatically
     cpu_target: float = 25.0           # target: percent of one CPU core for this program (dynamic)
-    recheck: float = 60.0              # seconds: when sitting still, check/improve the focus regularly (0 = off)
-    verify_delay: float = 1.5          # seconds until the check after a prediction
-    sharp_drop: float = 0.6            # sharpness fraction below which to refocus
+    blur: float = 0.35                 # refocus when the sharpness is more than this fraction below the reference (0.15–0.6)
     hold: float = 1.5                  # seconds this has to persist
     cooldown: float = 5.0              # lockout time after focusing
     eval_every: int = 10               # evaluate only every n-th camera frame (sharpness/face)
     freeze: bool = False               # output a still image during the search
     reset: bool = False                # ignore the learned calibration
+    manual: bool = False               # manual focus: the user moves the lens, the engine only says whether it is sharp
 
 
 class EngineError(Exception):
@@ -57,6 +57,10 @@ class EngineError(Exception):
 
 class Stopped(Exception):
     pass
+
+
+class Interrupted(Exception):
+    """Manual focus was switched on during a search."""
 
 
 def v4l2(dev, **ctrls):
@@ -112,6 +116,7 @@ class AutoFocus:
         self.preview_on = False            # the UI sets this while a preview is visible
         self.preview_width = 640           # desired width of the preview image in pixels
         self.preview_overlay = False       # draw the detected face frame into the preview image
+        self.manual_target = None          # manual focus: where the user wants the lens (set by a UI)
         self._reset_state()
 
     def _pick_camera(self):
@@ -147,7 +152,7 @@ class AutoFocus:
         self.focus = self.a.fmin
         self.mode = "off"
         self.log = deque(maxlen=8)
-        self.history = deque(maxlen=300)   # (time, focus, sharpness), every 0.1 s
+        self.history = deque(maxlen=300)   # (time, focus, sharpness, refocus threshold or None), every 0.1 s
         self.changed_t = 0.0
         self.last_hist = 0.0
         self.preview = None        # (width, height, BGR bytes) of the output image, scaled down
@@ -166,9 +171,10 @@ class AutoFocus:
         self.cooldown = 0.0
         self.lens_known, self._cmd = False, None    # the camera's own autofocus moved the lens: where it is, we do not know
         self.freeze = None         # still image during the search
-        self.verify_at = None      # time of the check after a prediction
-        self.recheck_at = None     # next regular check
+        self.kept = False          # the last search left the lens where it was
         self.face_t = time.time()  # last time a face was seen (at the start: since when we wait for one)
+        self.sharp = None          # manual focus: True = sharp (green), False = not (orange), None = cannot tell yet
+        self._seen, self._seen_w = {}, None   # manual focus: focus value -> sharpness, at this face width
 
     def _load_calibration(self):
         """Load the stored calibration of the current camera."""
@@ -314,10 +320,15 @@ class AutoFocus:
             self._make_preview(frame, now)
         if now - self.last_hist >= 0.1:
             self.last_hist = now
-            self.history.append((now, self.focus, self.ema or 0.0))
+            self.history.append((now, self.focus, self.ema or 0.0, self.threshold))
         if self.on_frame:
             self.on_frame(self)
         return frame
+
+    @property
+    def threshold(self):
+        """Sharpness below which it refocuses (None: no reference yet, or manual focus)."""
+        return None if self.ref is None or self.a.manual else self.ref * (1 - self.a.blur)
 
     def _make_preview(self, frame, now):
         """Scale down the output image (as it would arrive in Zoom); only on request, costs nothing otherwise."""
@@ -328,7 +339,8 @@ class AutoFocus:
             if s == 1:
                 small = small.copy()                         # do not draw into the image that goes to the virtual camera
             x, y, w, h = (int(v * s) for v in self.box)
-            color = (26, 153, 242) if self.mode == "searching focus" else (90, 179, 51)   # BGR: orange / green
+            orange = self.mode == "searching focus" or (self.a.manual and self.sharp is False)
+            color = (26, 153, 242) if orange else (90, 179, 51)   # BGR: orange / green
             cv2.rectangle(small, (x, y), (x + w, y + h), color, max(2, int(3 * s)))
         self.preview = (small.shape[1], small.shape[0], small.tobytes())
         self.preview_t = now
@@ -409,12 +421,13 @@ class AutoFocus:
     def search(self, box, reason):
         """Run a search and write one line about it to the search log (also when it is aborted)."""
         trace, t0, old, outcome = [], time.time(), self.focus, "aborted"
+        self.kept = False
         try:
             self._search(box, reason, trace)
             outcome = "done"
         finally:
             self._log_search(dict(time=time.strftime("%Y-%m-%d %H:%M:%S"), camera=self.cam.name if self.cam else None,
-                                  reason=reason, outcome=outcome, seconds=round(time.time() - t0, 1),
+                                  reason=reason, outcome=outcome, kept=self.kept, seconds=round(time.time() - t0, 1),
                                   width=box[2], start=old, end=self.focus, ref=self.ref and round(self.ref, 1),
                                   turns=sum(1 for a, b, c in zip(trace, trace[1:], trace[2:])
                                             if (b[0] - a[0]) * (c[0] - b[0]) < 0),
@@ -433,8 +446,6 @@ class AutoFocus:
 
     def _search(self, box, reason, trace):
         old = self.focus
-        verify = reason == "check"
-        self.verify_at = None
         self.mode = "searching focus"
         if self.a.dynamic:                                   # orange = no value: evaluate quickly, afterwards by load again
             self.a.eval_every = min(self.a.eval_every, 5)
@@ -442,6 +453,8 @@ class AutoFocus:
         scores = {}
 
         def score(v):
+            if self.a.manual:
+                raise Interrupted
             v = self._clamp(v)
             if v not in scores:
                 self.set_focus(v)
@@ -491,13 +504,7 @@ class AutoFocus:
 
         known = float(np.median([p[2] for p in self.calib.values()])) if self.calib else 0   # typical earlier sharpness
         center, predicted = None, False
-        if verify:                                           # check: only fine-tuning around the current value
-            center = sweep(old - 2 * FINE_STEP, FINE_STEP)
-            guess = self.predict(box[2])
-            if not peak(center) or at(center) < .3 * known or \
-                    (guess is not None and abs(center - guess) > 50 and at(center) < .6 * known):
-                center = None                                # check finds no peak -> full search
-        elif self.ref is not None or self.model is not None:   # search locally (after start or with a saved model)
+        if self.ref is not None or self.model is not None:   # search locally (after start or with a saved model)
             guess = self.predict(box[2])
             if guess is not None:                            # prediction from face width, fine-tuning only
                 center, predicted = sweep(guess - 24, SWEEP_STEP), True
@@ -518,48 +525,76 @@ class AutoFocus:
                 score(v)
             center = finish(max(scores, key=scores.get), 10)
         trusted = peak(center)
+        if self.ref is not None:                             # not the first focus: move only for a clearly sharper picture
+            near = min(scores, key=lambda k: abs(k - old))
+            was = scores[near] if abs(near - old) <= 5 else score(old)
+            if at(center) < MIN_GAIN * was:
+                center, trusted, self.kept = old, False, True
         self.set_focus(center)
         self.freeze = None
         now_box = self.find_face(self.last)                  # did the head move meanwhile? then the result belongs to another distance
         moved = now_box is not None and abs(now_box[2] / box[2] - 1) > self.a.size_tol
         if moved:
             trusted = False
-            self.box = now_box
+            self.box = box = now_box                         # measure where the face is now, not on the old box
         self.ref = self.measure(box, 5)
         if trusted and self.box is not None:                 # only clear peaks of a really detected face into memory
             self.record(box[2], center, self.ref)
-        self.recheck_at = time.time() + self.a.recheck if self.a.recheck else None
-        self.ref_w = box[2]                                  # stays the old width when moved, so the loop searches again
+        self.ref_w = box[2]                                  # face width at this focus (direction of the next search without prediction)
         self.ema = self.ref
         self.bad_since = None
-        self.cooldown = time.time() + (0.5 if moved else self.a.cooldown)   # moved: look again soon, the loop sees the new size
+        self.cooldown = time.time() + self.a.cooldown
         stamp = time.strftime('%H:%M:%S')
-        if verify and center == old:
-            self.log.append(f"{stamp}  Check: focus {center} is right")
+        if self.kept:
+            self.log.append(f"{stamp}  Focus {old} is right  ({reason})")
         else:
             self.changed_t = time.time()
             self.log.append(f"{stamp}  Focus {old} → {center}  ({reason}{' · prediction' if predicted else ''})")
-        if predicted:                                        # double-check the prediction again later
-            self.verify_at = time.time() + self.a.verify_delay
         self.mode = "tracking face"
 
     def needs_refocus(self, box, now):
-        """When to refocus? First measurement, face clearly closer/farther, or sharpness dropped."""
+        """When to refocus? First measurement, or the sharpness stayed below the allowed blur for `hold` seconds."""
         if self.ref is None:
             return "Start" if self.box is not None or now - self.face_t > 3 else None   # no face yet: wait 3 s, then try anyway
         if now < self.cooldown:
             return None
-        reason = None
-        tol = self.a.size_tol_pred if self.model else self.a.size_tol
-        if abs(box[2] / self.ref_w - 1) > tol:
-            reason = "face closer/farther"
-        elif self.ema < self.a.sharp_drop * self.ref:
-            reason = "image blurry"
-        if reason is None:
+        if self.ema >= self.threshold:
             self.bad_since = None
             return None
         self.bad_since = self.bad_since or now
-        return reason if now - self.bad_since > self.a.hold else None
+        return "image blurry" if now - self.bad_since > self.a.hold else None
+
+    # ---------- Manual focus ----------
+    def _manual_lens(self):
+        """Move the lens to where the user put the slider. Directly, without going below first: the user
+        judges the picture, and a detour would make the picture jump while dragging."""
+        if self.manual_target is None:
+            self.manual_target = self.focus
+        target = self._clamp(self.manual_target)
+        if target != self._cmd or not self.lens_known:
+            self._move(target)
+
+    def _judge(self, box, s):
+        """Manual focus: is the picture sharp? Compared with the sharpest picture seen at this face width
+        while the slider was moved; it can only tell once the slider covered some range."""
+        self.mode = "manual focus"
+        self.ema = s if self.ema is None else .5 * self.ema + .5 * s     # react quickly to the slider
+        if self._seen_w is None or abs(box[2] / self._seen_w - 1) > self.a.size_tol:
+            self._seen, self._seen_w = {}, box[2]                         # another distance: start over
+        self._seen[self.focus] = self.ema
+        if max(self._seen) - min(self._seen) < MANUAL_SPAN:
+            self.sharp = None
+        else:
+            self.sharp = self.ema >= MANUAL_GOOD * max(self._seen.values())
+
+    def _leave_manual(self):
+        """Back to autofocus: what it knew before no longer fits the lens position, so focus anew."""
+        self.ref = self.ref_w = None
+        self.bad_since = None
+        self.cooldown = 0.0
+        self.sharp, self._seen, self._seen_w = None, {}, None
+        self.mode = "tracking face"
+        self.face_t = time.time()
 
     # ---------- Main loop ----------
     def run(self):
@@ -574,11 +609,18 @@ class AutoFocus:
                 v4l2(self.dev, **{AUTO: 0})
             except EngineError:
                 pass                                         # no autofocus control (only focus_absolute): nothing to switch off
-            n = 0
+            n, manual = 0, False
             while True:
                 frame = self.grab()
                 now = time.time()
                 n += 1
+                if self.a.manual:
+                    manual, self.mode = True, "manual focus"     # at once, the first move can take seconds
+                    self._manual_lens()
+                    frame = self.last                            # after a move: a picture taken at the new position
+                elif manual:
+                    manual = False
+                    self._leave_manual()
                 if self.a.dynamic:
                     self._adapt(now)
                 k = max(1, int(self.a.eval_every))
@@ -589,10 +631,16 @@ class AutoFocus:
                     if found:
                         self.face_t = now
                         self.box = self._follow(found)
+                if manual:
+                    if now - self.face_t > 2.5:                  # no face: nothing to judge
+                        self.box, self.sharp, self.mode = None, None, "manual focus"
+                    else:
+                        box = self.box or (int(self.w * .35), int(self.h * .2), int(self.w * .3), int(self.h * .45))
+                        self._judge(box, sharpness(frame, box))
+                    continue
                 if self.ref is not None and now - self.face_t > 2.5:   # face gone (head turned): hold focus, do not search again
                     self.box = None
                     self.bad_since = None
-                    self.verify_at = None
                     if self.mode == "tracking face":
                         self.mode = "face lost (focus held)"
                     continue
@@ -603,18 +651,11 @@ class AutoFocus:
                 s = sharpness(frame, box)
                 self.ema = s if self.ema is None else .9 * self.ema + .1 * s
                 reason = self.needs_refocus(box, now)
-                if reason is None and self.verify_at and now >= self.verify_at:
-                    self.verify_at = None
-                    if abs(box[2] / self.ref_w - 1) <= self.a.size_tol_pred:   # only when you sit still
-                        reason = "check"
-                if (reason is None and self.recheck_at and now >= self.recheck_at and now >= self.cooldown
-                        and self.ref_w and abs(box[2] / self.ref_w - 1) <= self.a.size_tol_pred):
-                    if self.ema < .8 * self.ref:              # only touch the lens if the picture really got softer
-                        reason = "check"
-                    else:
-                        self.recheck_at = now + self.a.recheck
                 if reason:
-                    self.search(box, reason)
+                    try:
+                        self.search(box, reason)
+                    except Interrupted:                      # manual focus switched on: the next round takes over
+                        self.freeze, self.mode = None, "manual focus"
         except Stopped:
             pass
         finally:

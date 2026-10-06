@@ -198,13 +198,22 @@ class Search(unittest.TestCase):
             e.focus, e.ref, e.ref_w = 160, 500.0, 200
             e.box = (500, 200, 200, 240)
             e.search(e.box, "face closer/farther")
-            self.assertEqual(e.ref_w, 200)
+            self.assertEqual(e.ref_w, 300)                      # reference taken at the new distance
             self.assertEqual(e.box[2], 300)
             self.assertEqual(e.calib, {})                       # nothing learned from a moving head
-            self.assertLess(e.cooldown, time.time() + 1)
-            t = time.time() + 1
-            self.assertIsNone(e.needs_refocus(e.box, t))                 # the new size must persist first
-            self.assertEqual(e.needs_refocus(e.box, t + 2), "face closer/farther")
+            e.ema = e.ref
+            self.assertIsNone(e.needs_refocus(e.box, time.time() + 60))   # the blur trigger decides, not the size
+
+    def test_ref_is_measured_on_the_new_box_when_the_head_moved(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(engine, "CALIB_DIR", Path(tmp)):
+            e = engine_with_fake_lens(tmp, best=100)
+            seen = []
+            e.measure = lambda box, n=2: (seen.append((box, n)), 1000.0 * np.exp(-((e.focus - 100) / 40.0) ** 2))[1]
+            e.find_face = lambda frame: (500, 200, 300, 360)
+            e.focus, e.ref, e.ref_w = 160, 500.0, 200
+            e.box = (500, 200, 200, 240)
+            e.search(e.box, "image blurry")
+            self.assertEqual(seen[-1], ((500, 200, 300, 360), 5))
 
     def test_a_jumping_face_box_is_only_followed_once_confirmed(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -258,12 +267,11 @@ class Run(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             e = make_engine(tmp, CAM)
             e.ref, e.ref_w, e.ema, e.box = 5.0, 200, 5.0, (1, 2, 3, 4)
-            e.bad_since, e.verify_at, e.recheck_at, e.freeze = 1.0, 1.0, 1.0, np.zeros((2, 2, 3), np.uint8)
+            e.bad_since, e.freeze = 1.0, np.zeros((2, 2, 3), np.uint8)
             seen = {}
 
             def first_frame():
-                seen.update(ref=e.ref, ema=e.ema, box=e.box, verify_at=e.verify_at, recheck_at=e.recheck_at,
-                            bad_since=e.bad_since, freeze=e.freeze)
+                seen.update(ref=e.ref, ema=e.ema, box=e.box, bad_since=e.bad_since, freeze=e.freeze)
                 raise engine.Stopped
 
             e._open = lambda: setattr(e, "dev", CAM.dev)
@@ -271,7 +279,7 @@ class Run(unittest.TestCase):
             e.grab = first_frame
             with mock.patch.object(engine, "v4l2", side_effect=engine.EngineError("unknown control")):
                 e.run()                                  # switching AUTO off fails: that must not end the run
-            self.assertEqual(seen, dict.fromkeys(("ref", "ema", "box", "verify_at", "recheck_at", "bad_since", "freeze")))
+            self.assertEqual(seen, dict.fromkeys(("ref", "ema", "box", "bad_since", "freeze")))
             self.assertIsNone(e.error)
 
     def test_missing_ffmpeg_is_reported_and_releases_the_camera(self):
@@ -286,6 +294,85 @@ class Run(unittest.TestCase):
                 with self.assertRaisesRegex(engine.EngineError, "ffmpeg"):
                     e._open()
             cap.release.assert_called_once()
+
+
+class Manual(unittest.TestCase):
+    def test_sharp_or_not_only_once_the_slider_covered_some_range(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            e = make_engine(tmp, CAM)
+            box = (500, 200, 200, 240)
+            for f, s in ((100, 50.0), (110, 80.0)):
+                e.focus = f
+                e._judge(box, s)
+                self.assertIsNone(e.sharp)                  # less than MANUAL_SPAN covered: cannot tell
+            e.focus = 100 + engine.MANUAL_SPAN
+            for _ in range(10):                              # the fast ema settles at the sharpest value seen
+                e._judge(box, 200.0)
+            self.assertIs(e.sharp, True)
+            self.assertEqual(e.mode, "manual focus")
+            e.focus = 160
+            for _ in range(10):
+                e._judge(box, 60.0)
+            self.assertIs(e.sharp, False)
+            e._judge((500, 200, 300, 360), 60.0)             # another distance: start over
+            self.assertIsNone(e.sharp)
+
+    def test_switching_manual_on_interrupts_a_search(self):
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(engine, "CALIB_DIR", Path(tmp)):
+            e = engine_with_fake_lens(tmp, best=150)
+            calls = []
+
+            def measure(box, n=2):
+                calls.append(e.focus)
+                e.a.manual = len(calls) >= 3                 # the user ticks the box after two measurements
+                return 1000.0 / (1 + abs(e.focus - 150))
+            e.measure = measure
+            e.box = (500, 200, 200, 240)
+            with self.assertRaises(engine.Interrupted):
+                e.search(e.box, "Start")
+            self.assertEqual(len(calls), 3)                  # no further lens moves after that
+            self.assertIsNone(e.ref)
+            entry = json.loads((Path(tmp) / "search.log").read_text().splitlines()[-1])
+            self.assertEqual(entry["outcome"], "aborted")
+
+    def test_back_to_autofocus_focuses_anew(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            e = make_engine(tmp, CAM)
+            e.ref, e.ref_w, e.cooldown, e.sharp = 500.0, 200, time.time() + 60, True
+            e._leave_manual()
+            self.assertEqual((e.ref, e.ref_w, e.sharp, e.mode), (None, None, None, "tracking face"))
+            e.box = (500, 200, 200, 240)
+            self.assertEqual(e.needs_refocus(e.box, time.time()), "Start")
+
+    def test_the_run_moves_the_lens_straight_to_the_slider_and_does_not_search(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            e = make_engine(tmp, CAM)
+            e.w, e.h, e.a.settle, e.a.manual, e.a.eval_every = 1280, 720, 0, True, 1
+            e.find_face = lambda frame: (500, 200, 200, 240)
+            e.search = mock.Mock()
+            frames = []
+
+            def grab():
+                frames.append(1)
+                if len(frames) == 2:
+                    e.manual_target = 90                     # dragged down: no detour below the target
+                if len(frames) > 40:
+                    raise engine.Stopped
+                e.last = np.zeros((720, 1280, 3), np.uint8)
+                return e.last
+            e._open = lambda: setattr(e, "dev", CAM.dev)
+            e._close = lambda: None
+            e.grab = grab
+            e.manual_target = 120
+            sent = []
+            e._move = lambda cmd: (sent.append(cmd), setattr(e, "focus", cmd), setattr(e, "_cmd", cmd),
+                                   setattr(e, "lens_known", True))
+            with mock.patch.object(engine, "v4l2"):
+                e.run()
+            self.assertEqual(sent, [120, 90])
+            self.assertIsNotNone(e.ema)
+            e.search.assert_not_called()
+            self.assertEqual(e.focus, 90)
 
 
 class MissingVirtualCamera(unittest.TestCase):

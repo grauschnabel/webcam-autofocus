@@ -27,7 +27,10 @@ class Renderer:
         width = max(20, min(60, cols - 14))
         lo, hi = e.a.fmin, e.a.fmax
         pos = min(max(round((e.focus - lo) / (hi - lo) * (width - 1)), 0), width - 1)
-        color = YELLOW if e.mode == "searching focus" else GREEN
+        if e.a.manual:                                            # sharp / not sharp / cannot tell yet
+            color = {True: GREEN, False: YELLOW}.get(e.sharp, RESET)
+        else:
+            color = YELLOW if e.mode == "searching focus" else GREEN
         track = f"{DIM}{'━' * pos}{RESET}{color}●{RESET}{DIM}{'━' * (width - 1 - pos)}{RESET}"
         num = str(e.focus)
         start = min(max(pos - len(num) // 2, 0), width - len(num))

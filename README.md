@@ -44,10 +44,10 @@ video-call program:
 - **Autofocus on the face, not the scene:** contrast autofocus measured only on
   the detected face (OpenCV), with a coarse search followed by hill climbing.
 - **Learns your setup:** the relation between face size and focus is learned
-  and stored, so later focus changes are a single jump instead of a search.
-  A periodic check keeps improving it.
+  and stored, so a refocus only searches near the predicted value.
 - **Calm:** the focus is held when you turn your head away or look down, and it
-  only refocuses when you really move closer or further away or the picture gets blurry.
+  only refocuses when the picture has become blurrier than you allow (slider "Allowed blur",
+  default 35 %), and the lens only moves if the new position is clearly sharper.
 - **Virtual camera for video calls:** the corrected picture appears as
   *"&lt;your camera&gt; (Autofocus)"* (via v4l2loopback), so you know which one to
   choose in Zoom, Teams, Google Meet, OBS, Discord, a browser and so on.
@@ -57,6 +57,8 @@ video-call program:
   extension, ...): left click switches on/off, the lens is green (on), red (off)
   or orange (problem). A small window shows the focus slider, a sharpness graph,
   an optional preview and a log.
+- **Manual focus when you want it:** tick *Manual focus* and move the slider yourself
+  (drag or mouse wheel); green means sharp, orange means not sharp.
 - **Light on the CPU:** only every n-th frame is analysed (adjustable, or
   automatic by CPU load).
 - **Terminal view** (`webcam-autofocus`) for headless setups and debugging.
@@ -106,6 +108,12 @@ cd webcam-autofocus
 5. Leave the window or close it (the tray icon keeps running). Switch autofocus off when you
    do not need it.
 
+**Manual focus.** Tick *Manual focus* above the slider to set the focus yourself: drag the
+slider or turn the mouse wheel over it. The autofocus does not search meanwhile, it only tells
+you: the slider turns **green** when the picture is sharp and **orange** when it is not. It can
+judge that once you moved the slider over a little range (it compares with the sharpest picture
+it has seen). Untick the box and the autofocus takes over again and focuses anew.
+
 **About the administrator password.** The virtual camera is a device of the system, so creating
 it needs administrator rights (and it is created again after every reboot). With the `.deb`
 installed, local users get this without a password through a polkit rule that allows exactly
@@ -129,6 +137,8 @@ Useful options (all of them work for both commands):
 | `--device /dev/videoN` | use this camera instead of the one selected in the window |
 | `--fmin N`, `--fmax N` | limit the focus range that is searched (default 1–300, clamped to what the camera offers) |
 | `--eval-every N` | analyse only every n-th frame (default 10) |
+| `--blur F` | how much the sharpness may drop before refocusing, 0.15–0.6 (default 0.35; also a slider in the window) |
+| `--freeze` | the virtual camera shows a still picture while the lens searches (also a checkbox in the window) |
 | `--dynamic` | adapt `--eval-every` to the CPU load |
 | `--no-output` | only control the focus, no virtual camera |
 | `--reset` | ignore the stored calibration |
@@ -153,10 +163,12 @@ The default search range is 1–300. If your camera's sharp range lies further u
 
 1. A Haar cascade finds your face; sharpness is the variance of the Laplacian inside
    the face box.
-2. After a movement, the focus is searched coarsely over the range and then refined
-   by hill climbing. Each result is stored as *face width → focus*.
-3. From these points a line is fitted. Next time, the focus jumps to the predicted
-   value and is verified shortly afterwards.
+2. The first focus is searched coarsely over the range and then refined. Each result is
+   stored as *face width → focus*.
+3. From these points a line is fitted. Later searches only sweep around the predicted
+   value, and only when the sharpness stayed more than the allowed blur below the value
+   measured after the last focusing. The lens only moves if the result is clearly
+   (15 %) sharper than the old position.
 4. The camera's own continuous autofocus is switched off while the program runs and
    switched back on when you stop it.
 
