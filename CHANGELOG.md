@@ -6,6 +6,8 @@ the project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.2.0-rc1] - 2026-10-06
+
 ### Added
 - Checkbox "CPU" under the graph: also shows how much CPU the program uses (percent of one core).
 - Checkbox "Manual focus" above the slider: you move the focus yourself (drag the slider or use
